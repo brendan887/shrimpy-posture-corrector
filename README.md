@@ -29,7 +29,31 @@ The overlay includes live shoulder angles for each arm:
 - `flex`: flexion in the torso sagittal plane, where `0` is arm down, `90` is straight out in front, and `180` is overhead.
 - `abd`: abduction in the torso frontal plane, where `0` is arm down, `90` is straight out to the side, and `180` is overhead.
 
-For this MVP, stand mostly front-facing to the camera. The angles use MediaPipe world landmarks and a torso-relative frame, but flexion direction assumes webcam depth points toward the camera.
+For this MVP, start with a front-facing or 45-degree front-side camera view. The angles use MediaPipe world landmarks and a torso-relative frame, with optional in-session calibration to make the front, side, and down axes more personal.
+
+## Camera View
+
+Front view is best for abduction. A 45-degree view is often better for flexion because the forward arm raise is less hidden in camera depth.
+
+Recommended 45-degree test setup:
+
+- Put the camera at chest-ish height if possible.
+- Place it 6-8 feet away so shoulders, hips, and elbows stay visible.
+- Use `left-45` if the camera is at your left-front diagonal.
+- Use `right-45` if the camera is at your right-front diagonal.
+- Keep your torso facing your exercise direction, not turned toward the camera.
+
+## Calibration
+
+Press `c` in the webcam window to start calibration. The UI will guide you through:
+
+- Neutral: stand tall with arms relaxed down.
+- Forward raise: raise both arms straight forward to shoulder height.
+- Side raise: raise both arms out to your sides like a T.
+
+Each pose waits for visible landmarks and stillness, then shows a countdown before capture. Press `Space` during calibration to manually capture the current pose if needed.
+
+The saved accuracy roadmap is in `docs/accuracy_plan.md`.
 
 Useful options:
 
@@ -39,6 +63,8 @@ python live_pose_full.py --camera 1
 python live_pose_full.py --width 640 --height 480
 python live_pose_full.py --min-confidence 0.65
 python live_pose_full.py --angle-smoothing 0.15
+python live_pose_full.py --calibration-stillness 0.06
+python live_pose_full.py --view left-45
 ```
 
 Press `q` or `Esc` to quit.

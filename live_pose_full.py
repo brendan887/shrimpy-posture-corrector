@@ -5,6 +5,8 @@ import math
 import threading
 import time
 import urllib.request
+from collections import deque
+from dataclasses import dataclass, field
 from pathlib import Path
 
 import cv2
@@ -40,6 +42,110 @@ POSE_CONNECTIONS = (
 
 LEFT_ARM = {"name": "L", "shoulder": 11, "elbow": 13}
 RIGHT_ARM = {"name": "R", "shoulder": 12, "elbow": 14}
+CALIBRATION_LANDMARKS = (11, 12, 13, 14, 23, 24)
+VIEW_MODES = ("front", "left-45", "right-45")
+
+
+VIEW_GUIDANCE = {
+    "front": {
+        "title": "Front-view mode",
+        "instruction": "Camera centered in front. Best for abduction; flexion is more depth-sensitive.",
+    },
+    "left-45": {
+        "title": "Left 45-degree mode",
+        "instruction": "Place camera at your left-front 45 deg angle. Good compromise for flexion.",
+    },
+    "right-45": {
+        "title": "Right 45-degree mode",
+        "instruction": "Place camera at your right-front 45 deg angle. Good compromise for flexion.",
+    },
+}
+
+
+@dataclass(frozen=True)
+class CalibrationStep:
+    name: str
+    instruction: str
+
+
+@dataclass
+class CalibrationAxes:
+    down: tuple[float, float, float]
+    right: tuple[float, float, float]
+    forward: tuple[float, float, float]
+    left_side: tuple[float, float, float]
+    right_side: tuple[float, float, float]
+
+
+@dataclass
+class CalibrationState:
+    countdown_seconds: float = 3.0
+    stable_frames: int = 8
+    stillness_threshold: float = 0.045
+    max_unstable_frames: int = 10
+    active: bool = False
+    current_step: int = 0
+    countdown_started_at: float | None = None
+    unstable_frames: int = 0
+    status: str = "Press c to calibrate"
+    samples: dict[str, dict[int, tuple[float, float, float]]] = field(default_factory=dict)
+    axes: CalibrationAxes | None = None
+    landmark_buffer: deque = field(default_factory=lambda: deque(maxlen=30))
+    steps: tuple[CalibrationStep, ...] = (
+        CalibrationStep(
+            "neutral",
+            "Stand tall, arms relaxed at your sides, facing front.",
+        ),
+        CalibrationStep(
+            "forward",
+            "Raise both arms straight forward to shoulder height.",
+        ),
+        CalibrationStep(
+            "side",
+            "Raise both arms straight out to your sides like a T.",
+        ),
+    )
+
+    def start(self) -> None:
+        self.active = True
+        self.current_step = 0
+        self.countdown_started_at = None
+        self.unstable_frames = 0
+        self.samples.clear()
+        self.landmark_buffer.clear()
+        self.status = "Calibration started"
+
+    def step(self) -> CalibrationStep | None:
+        if not self.active or self.current_step >= len(self.steps):
+            return None
+        return self.steps[self.current_step]
+
+    def reset_countdown(self, status: str) -> None:
+        self.countdown_started_at = None
+        self.unstable_frames = 0
+        self.status = status
+
+    def advance(self, sample: dict[int, tuple[float, float, float]]) -> None:
+        step = self.step()
+        if step is None:
+            return
+
+        self.samples[step.name] = sample
+        self.current_step += 1
+        self.countdown_started_at = None
+        self.unstable_frames = 0
+        self.landmark_buffer.clear()
+
+        if self.current_step >= len(self.steps):
+            self.axes = build_calibration_axes(self.samples)
+            self.active = False
+            self.status = (
+                "Calibration complete"
+                if self.axes is not None
+                else "Calibration failed; press c to retry"
+            )
+        else:
+            self.status = f"Captured {step.name}. Next pose..."
 
 
 def ensure_model(model_path: Path) -> None:
@@ -79,7 +185,25 @@ def parse_args() -> argparse.Namespace:
         "--angle-smoothing",
         type=float,
         default=0.25,
-        help="EMA factor for angle readouts. 0 is very smooth, 1 is no smoothing.",
+        help="EMA factor for measurement vectors. 0 is very smooth, 1 is no smoothing.",
+    )
+    parser.add_argument(
+        "--calibration-stillness",
+        type=float,
+        default=0.045,
+        help="Normalized image-motion tolerance for calibration. Higher is more forgiving.",
+    )
+    parser.add_argument(
+        "--calibration-stable-frames",
+        type=int,
+        default=8,
+        help="Recent stable frames needed before calibration countdown can start.",
+    )
+    parser.add_argument(
+        "--view",
+        choices=VIEW_MODES,
+        default="front",
+        help="Camera placement hint for UI guidance. 45-degree modes still use torso-relative math.",
     )
     return parser.parse_args()
 
@@ -162,8 +286,25 @@ def v_normalize(v):
     return v_scale(v, 1.0 / length)
 
 
+def v_lerp(a, b, alpha: float):
+    return (
+        (alpha * a[0]) + ((1.0 - alpha) * b[0]),
+        (alpha * a[1]) + ((1.0 - alpha) * b[1]),
+        (alpha * a[2]) + ((1.0 - alpha) * b[2]),
+    )
+
+
 def project_onto_plane(v, normal):
     return v_sub(v, v_scale(normal, v_dot(v, normal)))
+
+
+def angle_between(a, b) -> float | None:
+    a_norm = v_normalize(a)
+    b_norm = v_normalize(b)
+    if a_norm is None or b_norm is None:
+        return None
+    dot = min(max(v_dot(a_norm, b_norm), -1.0), 1.0)
+    return math.degrees(math.acos(dot))
 
 
 def signed_plane_angle(vector, zero_axis, positive_axis, plane_normal) -> float | None:
@@ -177,18 +318,247 @@ def signed_plane_angle(vector, zero_axis, positive_axis, plane_normal) -> float 
     return degrees
 
 
+def average_vectors(vectors):
+    if not vectors:
+        return None
+    total = (0.0, 0.0, 0.0)
+    for vector in vectors:
+        total = v_add(total, vector)
+    return v_scale(total, 1.0 / len(vectors))
+
+
 def arm_landmarks_visible(image_landmarks, arm, threshold: float) -> bool:
     needed = (arm["shoulder"], arm["elbow"], 11, 12, 23, 24)
     return all(is_visible(image_landmarks[idx], threshold) for idx in needed)
 
 
-def calculate_arm_angles(result, visibility_threshold: float) -> dict[str, dict[str, float | None]]:
+def get_landmark_samples(result, visibility_threshold: float):
     if (
         not result
         or not result.pose_landmarks
         or not result.pose_world_landmarks
     ):
-        return {}
+        return None
+
+    image_landmarks = result.pose_landmarks[0]
+    world_landmarks = result.pose_world_landmarks[0]
+    if not all(is_visible(image_landmarks[idx], visibility_threshold) for idx in CALIBRATION_LANDMARKS):
+        return None
+
+    image_sample = {
+        idx: (
+            image_landmarks[idx].x,
+            image_landmarks[idx].y,
+            getattr(image_landmarks[idx], "z", 0.0),
+        )
+        for idx in CALIBRATION_LANDMARKS
+    }
+    world_sample = {
+        idx: vec_from_landmark(world_landmarks[idx])
+        for idx in CALIBRATION_LANDMARKS
+    }
+    return image_sample, world_sample
+
+
+def average_world_samples(samples) -> dict[int, tuple[float, float, float]]:
+    averaged = {}
+    for idx in CALIBRATION_LANDMARKS:
+        averaged[idx] = average_vectors([sample[idx] for sample in samples])
+    return averaged
+
+
+def sample_stillness(image_samples) -> float | None:
+    if len(image_samples) < 2:
+        return None
+
+    first = image_samples[0]
+    last = image_samples[-1]
+    distances = []
+    for idx in CALIBRATION_LANDMARKS:
+        delta = v_sub(last[idx], first[idx])
+        distances.append(v_norm(delta))
+    return sum(distances) / len(distances)
+
+
+def torso_axes_from_sample(sample) -> tuple | None:
+    left_shoulder = sample[11]
+    right_shoulder = sample[12]
+    left_hip = sample[23]
+    right_hip = sample[24]
+    shoulder_mid = v_scale(v_add(left_shoulder, right_shoulder), 0.5)
+    hip_mid = v_scale(v_add(left_hip, right_hip), 0.5)
+
+    up_axis = v_normalize(v_sub(shoulder_mid, hip_mid))
+    right_axis = v_normalize(v_sub(right_shoulder, left_shoulder))
+    if up_axis is None or right_axis is None:
+        return None
+
+    forward_axis = v_normalize(v_cross(right_axis, up_axis))
+    if forward_axis is None:
+        return None
+
+    if forward_axis[2] > 0:
+        forward_axis = v_scale(forward_axis, -1.0)
+
+    return up_axis, right_axis, forward_axis
+
+
+def upper_arm_vector(sample, arm):
+    return v_normalize(v_sub(sample[arm["elbow"]], sample[arm["shoulder"]]))
+
+
+def pose_matches_step(sample, step_name: str) -> tuple[bool, str]:
+    axes = torso_axes_from_sample(sample)
+    if axes is None:
+        return False, "Move so shoulders and hips are visible"
+
+    up_axis, _right_axis, _forward_axis = axes
+    down_axis = v_scale(up_axis, -1.0)
+    arm_angles = []
+    for arm in (LEFT_ARM, RIGHT_ARM):
+        upper_arm = upper_arm_vector(sample, arm)
+        if upper_arm is None:
+            return False, "Move so shoulders and elbows are visible"
+        arm_angle = angle_between(upper_arm, down_axis)
+        if arm_angle is not None:
+            arm_angles.append(arm_angle)
+
+    if step_name == "neutral" and any(angle > 55.0 for angle in arm_angles):
+        return False, "Relax arms down at your sides"
+    if step_name in {"forward", "side"} and any(angle < 45.0 for angle in arm_angles):
+        return False, "Raise both arms away from your torso"
+
+    return True, "Hold still"
+
+
+def build_calibration_axes(samples: dict[str, dict[int, tuple[float, float, float]]]) -> CalibrationAxes | None:
+    neutral = samples.get("neutral")
+    forward = samples.get("forward")
+    side = samples.get("side")
+    if not neutral or not forward or not side:
+        return None
+
+    axes = torso_axes_from_sample(neutral)
+    if axes is None:
+        return None
+
+    up_axis, right_axis, fallback_forward = axes
+    down_axis = v_scale(up_axis, -1.0)
+
+    forward_vectors = [
+        upper_arm_vector(forward, LEFT_ARM),
+        upper_arm_vector(forward, RIGHT_ARM),
+    ]
+    average_forward = average_vectors([vector for vector in forward_vectors if vector is not None])
+    forward_axis = (
+        v_normalize(project_onto_plane(average_forward, up_axis))
+        if average_forward is not None
+        else None
+    )
+    if forward_axis is None:
+        forward_axis = fallback_forward
+    elif v_dot(forward_axis, fallback_forward) < 0:
+        forward_axis = v_scale(forward_axis, -1.0)
+
+    left_side_axis = upper_arm_vector(side, LEFT_ARM)
+    right_side_axis = upper_arm_vector(side, RIGHT_ARM)
+    if left_side_axis is None:
+        left_side_axis = v_scale(right_axis, -1.0)
+    if right_side_axis is None:
+        right_side_axis = right_axis
+
+    left_side_axis = v_normalize(project_onto_plane(left_side_axis, up_axis))
+    right_side_axis = v_normalize(project_onto_plane(right_side_axis, up_axis))
+    if left_side_axis is None:
+        left_side_axis = v_scale(right_axis, -1.0)
+    if right_side_axis is None:
+        right_side_axis = right_axis
+
+    if v_dot(left_side_axis, v_scale(right_axis, -1.0)) < 0:
+        left_side_axis = v_scale(left_side_axis, -1.0)
+    if v_dot(right_side_axis, right_axis) < 0:
+        right_side_axis = v_scale(right_side_axis, -1.0)
+
+    return CalibrationAxes(
+        down=down_axis,
+        right=right_axis,
+        forward=forward_axis,
+        left_side=left_side_axis,
+        right_side=right_side_axis,
+    )
+
+
+def update_calibration(calibration: CalibrationState, result, visibility_threshold: float, now: float) -> None:
+    if not calibration.active:
+        return
+
+    step = calibration.step()
+    if step is None:
+        return
+
+    samples = get_landmark_samples(result, visibility_threshold)
+    if samples is None:
+        calibration.landmark_buffer.clear()
+        calibration.reset_countdown("Waiting for shoulders, elbows, and hips")
+        return
+
+    image_sample, world_sample = samples
+    pose_ok, pose_status = pose_matches_step(world_sample, step.name)
+    if not pose_ok:
+        calibration.landmark_buffer.clear()
+        calibration.reset_countdown(pose_status)
+        return
+
+    calibration.landmark_buffer.append((image_sample, world_sample))
+    if len(calibration.landmark_buffer) < calibration.stable_frames:
+        calibration.reset_countdown("Hold still")
+        return
+
+    recent = list(calibration.landmark_buffer)[-calibration.stable_frames:]
+    stillness = sample_stillness([item[0] for item in recent])
+    if stillness is None or stillness > calibration.stillness_threshold:
+        calibration.unstable_frames += 1
+        calibration.status = (
+            f"Hold still: movement {stillness or 0.0:.3f}"
+            f" / {calibration.stillness_threshold:.3f}"
+        )
+        if calibration.unstable_frames > calibration.max_unstable_frames:
+            calibration.countdown_started_at = None
+            calibration.unstable_frames = 0
+        return
+
+    calibration.unstable_frames = 0
+    if calibration.countdown_started_at is None:
+        calibration.countdown_started_at = now
+        calibration.status = "Countdown started"
+        return
+
+    remaining = calibration.countdown_seconds - (now - calibration.countdown_started_at)
+    calibration.status = f"Capturing in {max(math.ceil(remaining), 0)}"
+    if remaining <= 0:
+        calibration.advance(average_world_samples([item[1] for item in recent]))
+
+
+def capture_calibration_now(calibration: CalibrationState, result, visibility_threshold: float) -> None:
+    if not calibration.active:
+        return
+
+    samples = get_landmark_samples(result, visibility_threshold)
+    if samples is None:
+        calibration.status = "Cannot capture: landmarks are not visible"
+        return
+
+    _image_sample, world_sample = samples
+    calibration.advance(world_sample)
+
+
+def measurement_frame_from_result(result, visibility_threshold: float, calibration_axes: CalibrationAxes | None):
+    if (
+        not result
+        or not result.pose_landmarks
+        or not result.pose_world_landmarks
+    ):
+        return None
 
     image_landmarks = result.pose_landmarks[0]
     world_landmarks = result.pose_world_landmarks[0]
@@ -200,81 +570,98 @@ def calculate_arm_angles(result, visibility_threshold: float) -> dict[str, dict[
     shoulder_mid = v_scale(v_add(left_shoulder, right_shoulder), 0.5)
     hip_mid = v_scale(v_add(left_hip, right_hip), 0.5)
 
-    up_axis = v_normalize(v_sub(shoulder_mid, hip_mid))
-    right_axis = v_normalize(v_sub(right_shoulder, left_shoulder))
-    if up_axis is None or right_axis is None:
-        return {}
+    if calibration_axes is None:
+        up_axis = v_normalize(v_sub(shoulder_mid, hip_mid))
+        right_axis = v_normalize(v_sub(right_shoulder, left_shoulder))
+        if up_axis is None or right_axis is None:
+            return None
 
-    forward_axis = v_normalize(v_cross(right_axis, up_axis))
-    if forward_axis is None:
-        return {}
+        forward_axis = v_normalize(v_cross(right_axis, up_axis))
+        if forward_axis is None:
+            return None
 
-    # MediaPipe webcam depth is negative toward the camera for a front-facing user.
-    # This sign choice makes forward arm flexion report as positive.
-    if forward_axis[2] > 0:
-        forward_axis = v_scale(forward_axis, -1.0)
+        # Front/45-degree MVP assumption: anatomical front points roughly toward the camera.
+        if forward_axis[2] > 0:
+            forward_axis = v_scale(forward_axis, -1.0)
 
-    down_axis = v_scale(up_axis, -1.0)
-    angles = {}
+        down_axis = v_scale(up_axis, -1.0)
+        left_side_axis = v_scale(right_axis, -1.0)
+        right_side_axis = right_axis
+    else:
+        down_axis = calibration_axes.down
+        right_axis = calibration_axes.right
+        forward_axis = calibration_axes.forward
+        left_side_axis = calibration_axes.left_side
+        right_side_axis = calibration_axes.right_side
+
+    frame = {
+        "down": down_axis,
+        "right": right_axis,
+        "forward": forward_axis,
+        "L_side": left_side_axis,
+        "R_side": right_side_axis,
+        "L_upper_arm": None,
+        "R_upper_arm": None,
+    }
     for arm in (LEFT_ARM, RIGHT_ARM):
         if not arm_landmarks_visible(image_landmarks, arm, visibility_threshold):
-            angles[arm["name"]] = {"flexion": None, "abduction": None}
             continue
 
         shoulder = vec_from_landmark(world_landmarks[arm["shoulder"]])
         elbow = vec_from_landmark(world_landmarks[arm["elbow"]])
         upper_arm = v_normalize(v_sub(elbow, shoulder))
-        if upper_arm is None:
-            angles[arm["name"]] = {"flexion": None, "abduction": None}
+        frame[f"{arm['name']}_upper_arm"] = upper_arm
+
+    return frame
+
+
+def smooth_measurement_frame(current, previous, smoothing_factor: float):
+    if current is None:
+        return previous
+    if previous is None:
+        return current
+
+    alpha = min(max(smoothing_factor, 0.0), 1.0)
+    smoothed = {}
+    for key, current_value in current.items():
+        previous_value = previous.get(key)
+        if current_value is None:
+            smoothed[key] = previous_value
+        elif previous_value is None:
+            smoothed[key] = current_value
+        else:
+            smoothed[key] = v_normalize(v_lerp(current_value, previous_value, alpha))
+    return smoothed
+
+
+def angles_from_measurement_frame(frame) -> dict[str, dict[str, float | None]]:
+    if frame is None:
+        return {}
+
+    angles = {}
+    for arm_name in ("L", "R"):
+        upper_arm = frame.get(f"{arm_name}_upper_arm")
+        side_axis = frame.get(f"{arm_name}_side")
+        if upper_arm is None or side_axis is None:
+            angles[arm_name] = {"flexion": None, "abduction": None}
             continue
 
-        side_axis = (
-            v_normalize(v_sub(left_shoulder, right_shoulder))
-            if arm["name"] == "L"
-            else right_axis
-        )
-        if side_axis is None:
-            angles[arm["name"]] = {"flexion": None, "abduction": None}
-            continue
-
-        angles[arm["name"]] = {
+        angles[arm_name] = {
             "flexion": signed_plane_angle(
                 upper_arm,
-                zero_axis=down_axis,
-                positive_axis=forward_axis,
-                plane_normal=right_axis,
+                zero_axis=frame["down"],
+                positive_axis=frame["forward"],
+                plane_normal=frame["right"],
             ),
             "abduction": signed_plane_angle(
                 upper_arm,
-                zero_axis=down_axis,
+                zero_axis=frame["down"],
                 positive_axis=side_axis,
-                plane_normal=forward_axis,
+                plane_normal=frame["forward"],
             ),
         }
 
     return angles
-
-
-def smooth_angles(current, previous, smoothing_factor: float):
-    alpha = min(max(smoothing_factor, 0.0), 1.0)
-    smoothed = {}
-
-    for arm_name in ("L", "R"):
-        smoothed[arm_name] = {}
-        for angle_name in ("flexion", "abduction"):
-            current_value = current.get(arm_name, {}).get(angle_name)
-            previous_value = previous.get(arm_name, {}).get(angle_name)
-
-            if current_value is None:
-                smoothed[arm_name][angle_name] = previous_value
-            elif previous_value is None:
-                smoothed[arm_name][angle_name] = current_value
-            else:
-                smoothed[arm_name][angle_name] = (
-                    (alpha * current_value) + ((1.0 - alpha) * previous_value)
-                )
-
-    return smoothed
 
 
 def format_angle(value: float | None) -> str:
@@ -335,6 +722,63 @@ def draw_angle_panel(frame, angles) -> None:
         )
 
 
+def draw_calibration_panel(frame, calibration: CalibrationState, view_mode: str) -> None:
+    height, width = frame.shape[:2]
+    panel_width, panel_height = 560, 138
+    x = max(width - panel_width - 24, 24)
+    y = 24
+
+    overlay = frame.copy()
+    cv2.rectangle(
+        overlay,
+        (x - 10, y - 12),
+        (x + panel_width, y + panel_height),
+        (26, 20, 12),
+        -1,
+    )
+    cv2.addWeighted(overlay, 0.62, frame, 0.38, 0, frame)
+
+    if calibration.active:
+        step = calibration.step()
+        title = f"Calibration {calibration.current_step + 1}/{len(calibration.steps)}"
+        instruction = step.instruction if step else "Finishing calibration..."
+        status = calibration.status
+        color = (80, 220, 255)
+    elif calibration.axes is not None:
+        title = "Calibration ready"
+        instruction = "Using captured neutral, forward, and side axes."
+        status = "Press c to recalibrate"
+        color = (40, 255, 120)
+    else:
+        guidance = VIEW_GUIDANCE[view_mode]
+        title = guidance["title"]
+        instruction = guidance["instruction"]
+        status = (
+            calibration.status
+            if calibration.status != "Press c to calibrate"
+            else "Calibration optional: press c to calibrate if readings drift"
+        )
+        color = (220, 245, 255)
+
+    lines = (
+        (title, 0.68, color, 2),
+        (instruction, 0.52, (240, 240, 230), 1),
+        (status, 0.58, (255, 230, 160), 2),
+        ("Keys: c calibrate | Space capture | q/Esc quit", 0.48, (210, 210, 200), 1),
+    )
+    for idx, (text, scale, text_color, thickness) in enumerate(lines):
+        cv2.putText(
+            frame,
+            text,
+            (x, y + 18 + (idx * 30)),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            scale,
+            text_color,
+            thickness,
+            cv2.LINE_AA,
+        )
+
+
 def main() -> None:
     args = parse_args()
     ensure_model(args.model)
@@ -379,10 +823,16 @@ def main() -> None:
     last_timestamp_ms = 0
     previous_frame_time = time.perf_counter()
     fps = 0.0
-    smoothed_angles = {}
+    calibration = CalibrationState()
+    calibration.stillness_threshold = args.calibration_stillness
+    calibration.stable_frames = max(args.calibration_stable_frames, 2)
+    calibration.landmark_buffer = deque(maxlen=max(calibration.stable_frames * 3, 30))
+    smoothed_measurement_frame = None
+    missing_measurement_frames = 0
 
     with PoseLandmarker.create_from_options(options) as landmarker:
         while True:
+            now = time.perf_counter()
             ok, frame = cap.read()
             if not ok:
                 print("No frame from camera; exiting.")
@@ -402,22 +852,39 @@ def main() -> None:
                 result = latest_result["value"]
                 result_timestamp_ms = latest_result["timestamp_ms"]
 
+            update_calibration(calibration, result, args.min_confidence, now)
             pose_count = draw_pose(frame, result, args.min_confidence)
-            angles = calculate_arm_angles(result, args.min_confidence)
-            smoothed_angles = smooth_angles(
-                angles,
-                smoothed_angles,
-                args.angle_smoothing,
+            measurement_frame = measurement_frame_from_result(
+                result,
+                args.min_confidence,
+                calibration.axes,
             )
+            if measurement_frame is None:
+                missing_measurement_frames += 1
+                if missing_measurement_frames > 30:
+                    smoothed_measurement_frame = None
+                else:
+                    smoothed_measurement_frame = smooth_measurement_frame(
+                        measurement_frame,
+                        smoothed_measurement_frame,
+                        args.angle_smoothing,
+                    )
+            else:
+                missing_measurement_frames = 0
+                smoothed_measurement_frame = smooth_measurement_frame(
+                    measurement_frame,
+                    smoothed_measurement_frame,
+                    args.angle_smoothing,
+                )
+            angles = angles_from_measurement_frame(smoothed_measurement_frame)
 
-            now = time.perf_counter()
             instantaneous_fps = 1.0 / max(now - previous_frame_time, 1e-6)
             fps = instantaneous_fps if fps == 0.0 else (fps * 0.9) + (instantaneous_fps * 0.1)
             previous_frame_time = now
 
             cv2.putText(
                 frame,
-                f"MediaPipe Pose Full | poses: {pose_count} | fps: {fps:4.1f}",
+                f"MediaPipe Pose Full | view: {args.view} | poses: {pose_count} | fps: {fps:4.1f}",
                 (24, 36),
                 cv2.FONT_HERSHEY_SIMPLEX,
                 0.8,
@@ -435,11 +902,20 @@ def main() -> None:
                 2,
                 cv2.LINE_AA,
             )
-            draw_angle_panel(frame, smoothed_angles)
+            draw_angle_panel(frame, angles)
+            draw_calibration_panel(frame, calibration, args.view)
 
             cv2.imshow("Shrimpy Pose MVP", frame)
             key = cv2.waitKey(1) & 0xFF
-            if key in (27, ord("q")):
+            if key == ord("c"):
+                calibration.start()
+                smoothed_measurement_frame = None
+                missing_measurement_frames = 0
+            elif key == ord(" "):
+                capture_calibration_now(calibration, result, args.min_confidence)
+                smoothed_measurement_frame = None
+                missing_measurement_frames = 0
+            elif key in (27, ord("q")):
                 break
 
     cap.release()
