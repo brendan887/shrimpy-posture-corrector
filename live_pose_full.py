@@ -9,6 +9,7 @@ import urllib.request
 from collections import deque
 from dataclasses import dataclass, field
 from pathlib import Path
+from statistics import mean, median, pstdev
 
 import cv2
 import mediapipe as mp
@@ -847,6 +848,120 @@ def make_diagnostic_sample(
     }
 
 
+def percentile(values: list[float], percent: float) -> float | None:
+    if not values:
+        return None
+
+    sorted_values = sorted(values)
+    if len(sorted_values) == 1:
+        return sorted_values[0]
+
+    position = (len(sorted_values) - 1) * (percent / 100.0)
+    lower_index = math.floor(position)
+    upper_index = math.ceil(position)
+    if lower_index == upper_index:
+        return sorted_values[lower_index]
+
+    lower_value = sorted_values[lower_index]
+    upper_value = sorted_values[upper_index]
+    weight = position - lower_index
+    return lower_value + ((upper_value - lower_value) * weight)
+
+
+def nearest_sample(samples: list[dict], target_time: float) -> dict | None:
+    if not samples:
+        return None
+    return min(
+        samples,
+        key=lambda sample: abs(sample.get("time_monotonic", target_time) - target_time),
+    )
+
+
+def summarize_angle_values(values: list[float], total_samples: int) -> dict:
+    if not values:
+        return {
+            "prevailing_angle": None,
+            "min": None,
+            "max": None,
+            "range": None,
+            "mean": None,
+            "stdev": None,
+            "p10": None,
+            "p90": None,
+            "valid_samples": 0,
+            "total_samples": total_samples,
+            "valid_ratio": 0.0 if total_samples else None,
+        }
+
+    min_value = min(values)
+    max_value = max(values)
+    return {
+        "prevailing_angle": median(values),
+        "min": min_value,
+        "max": max_value,
+        "range": max_value - min_value,
+        "mean": mean(values),
+        "stdev": pstdev(values) if len(values) > 1 else 0.0,
+        "p10": percentile(values, 10),
+        "p90": percentile(values, 90),
+        "valid_samples": len(values),
+        "total_samples": total_samples,
+        "valid_ratio": len(values) / total_samples if total_samples else None,
+    }
+
+
+def summarize_capture(capture: dict) -> dict:
+    samples = capture.get("pre_samples", []) + capture.get("post_samples", [])
+    marked_sample = nearest_sample(samples, capture.get("marked_at", 0.0))
+    times = [
+        sample["time_monotonic"]
+        for sample in samples
+        if sample.get("time_monotonic") is not None
+    ]
+
+    angles = {}
+    for arm_name in ("L", "R"):
+        angles[arm_name] = {}
+        for angle_name in ("flexion", "abduction"):
+            values = []
+            for sample in samples:
+                value = (
+                    sample.get("angles", {})
+                    .get(arm_name, {})
+                    .get(angle_name)
+                )
+                if value is not None:
+                    values.append(value)
+            angles[arm_name][angle_name] = summarize_angle_values(
+                values,
+                total_samples=len(samples),
+            )
+
+    return {
+        "source": "displayed_smoothed_angles",
+        "prevailing_method": "median",
+        "capture_window_sample_count": len(samples),
+        "capture_window_duration_seconds": (
+            max(times) - min(times)
+            if len(times) >= 2
+            else 0.0
+            if times
+            else None
+        ),
+        "marked_sample_time_monotonic": (
+            marked_sample.get("time_monotonic")
+            if marked_sample
+            else None
+        ),
+        "marked_angles": (
+            marked_sample.get("angles")
+            if marked_sample
+            else None
+        ),
+        "angles": angles,
+    }
+
+
 def mark_test_capture(
     test_capture: TestCaptureState,
     history,
@@ -968,6 +1083,9 @@ def update_test_capture(test_capture: TestCaptureState, sample: dict, output_dir
     output_path = (
         output_dir
         / f"{test_capture.session_id}_{test_capture.capture_index:02d}_{pose_name}.json"
+    )
+    test_capture.pending_capture["angle_summary"] = summarize_capture(
+        test_capture.pending_capture
     )
     output_path.write_text(
         json.dumps(test_capture.pending_capture, indent=2),

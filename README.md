@@ -64,7 +64,7 @@ Press `t` to start a repeatable diagnostic sequence. The UI prompts:
 - Arms out to the side in a T.
 - Arms directly overhead.
 
-For each prompt, hold the pose still. The app shows a countdown and captures automatically. Press `Space` if you want to manually capture the current pose immediately. The app saves a PNG image plus a JSON file in `captures/`. The JSON includes the image path, view mode, calibrated/uncalibrated measurement mode, raw MediaPipe landmarks, raw/smoothed measurement vectors, and measured flexion/abduction angles for a short window before and after the capture mark. This works whether calibration is active or not.
+For each prompt, hold the pose still. The app shows a countdown and captures automatically. Press `Space` if you want to manually capture the current pose immediately. The app saves a PNG image plus a JSON file in `captures/`. The JSON includes the image path, view mode, calibrated/uncalibrated measurement mode, raw MediaPipe landmarks, raw/smoothed measurement vectors, measured flexion/abduction angles for a short window before and after the capture mark, and an `angle_summary` with prevailing median angles, min/max range, mean, standard deviation, p10/p90, and valid sample counts. This works whether calibration is active or not.
 
 Useful options:
 
@@ -78,6 +78,12 @@ python live_pose_full.py --calibration-stillness 0.06
 python live_pose_full.py --view left-45
 python live_pose_full.py --test-window-seconds 3
 python live_pose_full.py --test-countdown-seconds 2 --test-stillness 0.06
+```
+
+Regenerate diagnostic summary charts:
+
+```bash
+python visualize_captures.py --capture-dir captures
 ```
 
 Press `q` or `Esc` to quit.
