@@ -22,7 +22,7 @@ POSE_ORDER = ("arms_down", "arms_forward", "arms_side_t", "arms_overhead")
 
 def load_capture(path: Path) -> dict:
     data = json.loads(path.read_text())
-    if "angle_summary" not in data:
+    if data.get("type") != "rom_sweep" and "angle_summary" not in data:
         data["angle_summary"] = summarize_capture(data)
         path.write_text(json.dumps(data, indent=2), encoding="utf-8")
     data["_path"] = path
@@ -135,6 +135,58 @@ def plot_session(session_id: str, captures: list[dict], output_path: Path) -> No
     plt.close(fig)
 
 
+def plot_rom_sweep(capture: dict, output_path: Path) -> None:
+    arm = capture.get("arm", "L")
+    samples = capture.get("samples", [])
+    if not samples:
+        return
+
+    start_time = capture.get("started_at", samples[0].get("time_monotonic", 0.0))
+    times = np.array([
+        sample.get("time_monotonic", start_time) - start_time
+        for sample in samples
+    ])
+    flexion = np.array([
+        sample.get("angles", {}).get(arm, {}).get("flexion", np.nan)
+        for sample in samples
+    ], dtype=float)
+    abduction = np.array([
+        sample.get("angles", {}).get(arm, {}).get("abduction", np.nan)
+        for sample in samples
+    ], dtype=float)
+    summary = capture.get("rom_summary", {})
+
+    fig, ax = plt.subplots(figsize=(10, 5.4))
+    ax.plot(times, flexion, color="#4AA8FF", linewidth=2.5, label=f"{arm} flexion")
+    ax.plot(times, abduction, color="#4DD17A", linewidth=1.8, label=f"{arm} abduction")
+    ax.axhline(0, color="#30343b", linewidth=1)
+    ax.axhline(90, color="#828892", linewidth=1, linestyle="--")
+    ax.axhline(180, color="#828892", linewidth=1, linestyle=":")
+
+    min_time = summary.get("min_flexion_time_offset")
+    max_time = summary.get("max_flexion_time_offset")
+    if min_time is not None:
+        ax.axvline(min_time, color="#F5A64A", linestyle="--", linewidth=1.5, label="min flex")
+    if max_time is not None:
+        ax.axvline(max_time, color="#E8667A", linestyle="--", linewidth=1.5, label="max flex")
+
+    ax.set_ylim(-90, 210)
+    ax.set_xlabel("Time (s)")
+    ax.set_ylabel("Angle (deg)")
+    ax.grid(alpha=0.22)
+    ax.legend(loc="best")
+    title = (
+        f"{capture.get('pose')} | {capture.get('view')} | {capture.get('measurement_mode')} | "
+        f"ROM={summary.get('rom'):.1f} deg"
+        if summary.get("rom") is not None
+        else f"{capture.get('pose')} | ROM unavailable"
+    )
+    ax.set_title(title)
+    fig.tight_layout()
+    fig.savefig(output_path, dpi=160)
+    plt.close(fig)
+
+
 def visualize(capture_dir: Path) -> list[Path]:
     captures = [load_capture(path) for path in sorted(capture_dir.glob("*.json"))]
     generated = []
@@ -142,6 +194,12 @@ def visualize(capture_dir: Path) -> list[Path]:
     sessions = defaultdict(list)
     for capture in captures:
         json_path = capture["_path"]
+        if capture.get("type") == "rom_sweep":
+            rom_output = json_path.with_name(f"{json_path.stem}_summary.png")
+            plot_rom_sweep(capture, rom_output)
+            generated.append(rom_output)
+            continue
+
         capture_output = json_path.with_name(f"{json_path.stem}_summary.png")
         plot_capture(capture, capture_output)
         generated.append(capture_output)

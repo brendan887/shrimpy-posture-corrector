@@ -233,6 +233,74 @@ class TestCaptureState:
         self.status = status
 
 
+@dataclass(frozen=True)
+class ROMSweepStep:
+    name: str
+    arm: str
+    instruction: str
+
+
+@dataclass
+class ROMSweepState:
+    duration_seconds: float = 10.0
+    active: bool = False
+    recording: bool = False
+    current_step: int = 0
+    session_id: str = ""
+    capture_index: int = 0
+    started_at: float = 0.0
+    status: str = "Press r to start ROM sweep"
+    samples: list[dict] = field(default_factory=list)
+    key_frames: dict[str, dict] = field(default_factory=dict)
+    last_saved_json_path: Path | None = None
+    steps: tuple[ROMSweepStep, ...] = (
+        ROMSweepStep(
+            "left_flexion_sweep",
+            "L",
+            "Left arm only: start down, sweep forward/up overhead, then return down.",
+        ),
+        ROMSweepStep(
+            "right_flexion_sweep",
+            "R",
+            "Right arm only: start down, sweep forward/up overhead, then return down.",
+        ),
+    )
+
+    def start(self) -> None:
+        self.active = True
+        self.recording = False
+        self.current_step = 0
+        self.capture_index = 0
+        self.started_at = 0.0
+        self.samples.clear()
+        self.key_frames.clear()
+        self.last_saved_json_path = None
+        self.session_id = time.strftime("%Y%m%d_%H%M%S")
+        self.status = "ROM test started. Press Space to record left arm."
+
+    def step(self) -> ROMSweepStep | None:
+        if not self.active or self.current_step >= len(self.steps):
+            return None
+        return self.steps[self.current_step]
+
+    def begin_recording(self, now: float) -> None:
+        step = self.step()
+        if step is None:
+            self.finish_if_done()
+            return
+        self.recording = True
+        self.started_at = now
+        self.samples.clear()
+        self.key_frames.clear()
+        self.status = f"Recording {step.name}"
+
+    def finish_if_done(self) -> None:
+        if self.current_step >= len(self.steps):
+            self.active = False
+            self.recording = False
+            self.status = "ROM sweep complete. Press r to repeat."
+
+
 def ensure_model(model_path: Path) -> None:
     if model_path.exists():
         return
@@ -319,6 +387,17 @@ def parse_args() -> argparse.Namespace:
         type=int,
         default=8,
         help="Recent stable frames needed before diagnostic countdown can start.",
+    )
+    parser.add_argument(
+        "--rom-sweep-seconds",
+        type=float,
+        default=10.0,
+        help="Seconds to record each left/right shoulder flexion ROM sweep.",
+    )
+    parser.add_argument(
+        "--no-visualize-on-quit",
+        action="store_true",
+        help="Skip regenerating capture summary charts when the app exits.",
     )
     return parser.parse_args()
 
@@ -962,6 +1041,194 @@ def summarize_capture(capture: dict) -> dict:
     }
 
 
+def sample_angle(sample: dict, arm_name: str, angle_name: str) -> float | None:
+    return (
+        sample.get("angles", {})
+        .get(arm_name, {})
+        .get(angle_name)
+    )
+
+
+def update_rom_key_frames(rom: ROMSweepState, sample: dict, frame) -> None:
+    step = rom.step()
+    if step is None:
+        return
+
+    flexion = sample_angle(sample, step.arm, "flexion")
+    if flexion is None:
+        return
+
+    if "start" not in rom.key_frames:
+        rom.key_frames["start"] = {
+            "sample": sample,
+            "frame": frame.copy(),
+        }
+
+    current_min = rom.key_frames.get("min_flexion", {}).get("sample")
+    if current_min is None or flexion < sample_angle(current_min, step.arm, "flexion"):
+        rom.key_frames["min_flexion"] = {
+            "sample": sample,
+            "frame": frame.copy(),
+        }
+
+    current_max = rom.key_frames.get("max_flexion", {}).get("sample")
+    if current_max is None or flexion > sample_angle(current_max, step.arm, "flexion"):
+        rom.key_frames["max_flexion"] = {
+            "sample": sample,
+            "frame": frame.copy(),
+        }
+
+    current_near_90 = rom.key_frames.get("near_90", {}).get("sample")
+    if (
+        current_near_90 is None
+        or abs(flexion - 90.0) < abs(sample_angle(current_near_90, step.arm, "flexion") - 90.0)
+    ):
+        rom.key_frames["near_90"] = {
+            "sample": sample,
+            "frame": frame.copy(),
+        }
+
+    rom.key_frames["end"] = {
+        "sample": sample,
+        "frame": frame.copy(),
+    }
+
+
+def summarize_rom_sweep(recording: dict) -> dict:
+    arm = recording["arm"]
+    samples = recording.get("samples", [])
+    flexion_values = [
+        sample_angle(sample, arm, "flexion")
+        for sample in samples
+        if sample_angle(sample, arm, "flexion") is not None
+    ]
+    abduction_values = [
+        sample_angle(sample, arm, "abduction")
+        for sample in samples
+        if sample_angle(sample, arm, "abduction") is not None
+    ]
+
+    if not flexion_values:
+        return {
+            "arm": arm,
+            "valid_samples": 0,
+            "total_samples": len(samples),
+            "valid_ratio": 0.0 if samples else None,
+            "min_flexion": None,
+            "max_flexion": None,
+            "rom": None,
+        }
+
+    min_sample = min(
+        samples,
+        key=lambda sample: (
+            sample_angle(sample, arm, "flexion")
+            if sample_angle(sample, arm, "flexion") is not None
+            else float("inf")
+        ),
+    )
+    max_sample = max(
+        samples,
+        key=lambda sample: (
+            sample_angle(sample, arm, "flexion")
+            if sample_angle(sample, arm, "flexion") is not None
+            else float("-inf")
+        ),
+    )
+    min_flexion = sample_angle(min_sample, arm, "flexion")
+    max_flexion = sample_angle(max_sample, arm, "flexion")
+    start_time = recording.get("started_at", samples[0].get("time_monotonic", 0.0))
+
+    return {
+        "arm": arm,
+        "source": "displayed_smoothed_angles",
+        "sample_count": len(samples),
+        "valid_samples": len(flexion_values),
+        "valid_ratio": len(flexion_values) / len(samples) if samples else None,
+        "duration_seconds": (
+            samples[-1]["time_monotonic"] - samples[0]["time_monotonic"]
+            if len(samples) >= 2
+            else 0.0
+        ),
+        "min_flexion": min_flexion,
+        "max_flexion": max_flexion,
+        "rom": max_flexion - min_flexion if min_flexion is not None and max_flexion is not None else None,
+        "start_flexion": sample_angle(samples[0], arm, "flexion"),
+        "end_flexion": sample_angle(samples[-1], arm, "flexion"),
+        "max_abduction_during_sweep": max(abduction_values) if abduction_values else None,
+        "abduction_range_during_sweep": (
+            max(abduction_values) - min(abduction_values)
+            if abduction_values
+            else None
+        ),
+        "min_flexion_time_offset": min_sample["time_monotonic"] - start_time,
+        "max_flexion_time_offset": max_sample["time_monotonic"] - start_time,
+        "min_flexion_abduction": sample_angle(min_sample, arm, "abduction"),
+        "max_flexion_abduction": sample_angle(max_sample, arm, "abduction"),
+        "flexion_stats": summarize_angle_values(flexion_values, len(samples)),
+        "abduction_stats": summarize_angle_values(abduction_values, len(samples)),
+    }
+
+
+def save_rom_sweep(rom: ROMSweepState, output_dir: Path) -> None:
+    step = rom.step()
+    if step is None:
+        return
+    if not rom.samples:
+        rom.recording = False
+        rom.status = f"No samples captured for {step.name}. Press Space to retry."
+        return
+
+    output_dir.mkdir(parents=True, exist_ok=True)
+    rom.capture_index += 1
+    prefix = f"{rom.session_id}_rom_{rom.capture_index:02d}_{step.name}"
+    image_paths = {}
+    key_frame_metadata = {}
+    for label, item in rom.key_frames.items():
+        image_path = output_dir / f"{prefix}_{label}.png"
+        cv2.imwrite(str(image_path), item["frame"])
+        image_paths[label] = str(image_path)
+        key_frame_metadata[label] = {
+            "time_monotonic": item["sample"].get("time_monotonic"),
+            "angles": item["sample"].get("angles"),
+        }
+
+    recording = {
+        "type": "rom_sweep",
+        "session_id": rom.session_id,
+        "capture_index": rom.capture_index,
+        "pose": step.name,
+        "arm": step.arm,
+        "instruction": step.instruction,
+        "view": rom.samples[-1].get("view"),
+        "measurement_mode": (
+            "calibrated"
+            if rom.samples[-1].get("calibration_ready")
+            else "uncalibrated"
+        ),
+        "calibration_ready_at_capture": bool(rom.samples[-1].get("calibration_ready")),
+        "started_at": rom.started_at,
+        "duration_target_seconds": rom.duration_seconds,
+        "image_paths": image_paths,
+        "key_frames": key_frame_metadata,
+        "samples": rom.samples,
+    }
+    recording["rom_summary"] = summarize_rom_sweep(recording)
+
+    output_path = output_dir / f"{prefix}.json"
+    output_path.write_text(json.dumps(recording, indent=2), encoding="utf-8")
+    rom.last_saved_json_path = output_path
+    rom.current_step += 1
+    rom.recording = False
+    rom.samples.clear()
+    rom.key_frames.clear()
+    next_step = rom.step()
+    if next_step is None:
+        rom.finish_if_done()
+    else:
+        rom.status = f"Saved {step.name}. Press Space for {next_step.name}."
+
+
 def mark_test_capture(
     test_capture: TestCaptureState,
     history,
@@ -1209,7 +1476,7 @@ def draw_calibration_panel(frame, calibration: CalibrationState, view_mode: str)
         (title, 0.68, color, 2),
         (instruction, 0.52, (240, 240, 230), 1),
         (status, 0.58, (255, 230, 160), 2),
-        ("Keys: c calibrate | t test | Space capture | q/Esc quit", 0.48, (210, 210, 200), 1),
+        ("Keys: c calibrate | t static | r ROM | Space action | q/Esc quit", 0.48, (210, 210, 200), 1),
     )
     for idx, (text, scale, text_color, thickness) in enumerate(lines):
         cv2.putText(
@@ -1286,6 +1553,83 @@ def draw_test_capture_panel(frame, test_capture: TestCaptureState) -> None:
         )
 
 
+def draw_rom_panel(frame, rom: ROMSweepState, now: float) -> None:
+    if not rom.active and rom.last_saved_json_path is None:
+        return
+
+    height, width = frame.shape[:2]
+    panel_width, panel_height = 620, 128
+    x = 24
+    y = max(height - panel_height - 24, 24)
+
+    overlay = frame.copy()
+    cv2.rectangle(
+        overlay,
+        (x - 10, y - 12),
+        (x + panel_width, y + panel_height),
+        (18, 12, 34),
+        -1,
+    )
+    cv2.addWeighted(overlay, 0.64, frame, 0.36, 0, frame)
+
+    step = rom.step()
+    if rom.recording and step is not None:
+        remaining = max(rom.duration_seconds - (now - rom.started_at), 0.0)
+        title = f"ROM sweep recording: {step.arm} arm"
+        instruction = step.instruction
+        expected = "Sweep down -> overhead -> down. Keep torso as still as practical."
+        status = f"{remaining:4.1f}s left | Space finishes early"
+        color = (190, 120, 255)
+    elif step is not None:
+        title = f"ROM sweep {rom.current_step + 1}/{len(rom.steps)}: {step.arm} arm"
+        instruction = step.instruction
+        expected = "Press Space to start timed recording."
+        status = rom.status
+        color = (190, 120, 255)
+    else:
+        title = "ROM sweep complete"
+        instruction = "Press r to repeat left/right flexion ROM sweeps."
+        expected = (
+            f"Last saved: {rom.last_saved_json_path}"
+            if rom.last_saved_json_path
+            else "No ROM sweep saved yet."
+        )
+        status = rom.status
+        color = (40, 255, 120)
+
+    lines = (
+        (title, 0.66, color, 2),
+        (instruction, 0.54, (245, 240, 255), 1),
+        (expected, 0.48, (220, 205, 255), 1),
+        (status, 0.54, (255, 230, 160), 2),
+    )
+    for idx, (text, scale, text_color, thickness) in enumerate(lines):
+        cv2.putText(
+            frame,
+            text[:95],
+            (x, y + 18 + (idx * 29)),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            scale,
+            text_color,
+            thickness,
+            cv2.LINE_AA,
+        )
+
+
+def generate_visualizations_on_quit(capture_dir: Path) -> None:
+    json_files = list(capture_dir.glob("*.json"))
+    if not json_files:
+        return
+
+    try:
+        from visualize_captures import visualize
+
+        generated = visualize(capture_dir)
+        print(f"Generated {len(generated)} capture visualization(s) in {capture_dir}.")
+    except Exception as exc:
+        print(f"Could not generate capture visualizations: {exc}")
+
+
 def main() -> None:
     args = parse_args()
     ensure_model(args.model)
@@ -1342,6 +1686,7 @@ def main() -> None:
         stillness_threshold=args.test_stillness,
     )
     test_capture.stillness_buffer = deque(maxlen=max(test_capture.stable_frames * 3, 30))
+    rom_sweep = ROMSweepState(duration_seconds=args.rom_sweep_seconds)
     diagnostic_history = deque(maxlen=max(int(args.test_window_seconds * 90), 180))
     smoothed_measurement_frame = None
     missing_measurement_frames = 0
@@ -1410,6 +1755,11 @@ def main() -> None:
                 image_sample=image_sample,
             )
             diagnostic_history.append(diagnostic_sample)
+            if rom_sweep.recording:
+                rom_sweep.samples.append(diagnostic_sample)
+                update_rom_key_frames(rom_sweep, diagnostic_sample, frame)
+                if now - rom_sweep.started_at >= rom_sweep.duration_seconds:
+                    save_rom_sweep(rom_sweep, args.capture_dir)
             update_test_auto_capture(
                 test_capture,
                 result,
@@ -1448,6 +1798,7 @@ def main() -> None:
             draw_angle_panel(frame, angles)
             draw_calibration_panel(frame, calibration, args.view)
             draw_test_capture_panel(frame, test_capture)
+            draw_rom_panel(frame, rom_sweep, now)
 
             cv2.imshow("Shrimpy Pose MVP", frame)
             key = cv2.waitKey(1) & 0xFF
@@ -1456,7 +1807,13 @@ def main() -> None:
                 smoothed_measurement_frame = None
                 missing_measurement_frames = 0
             elif key == ord("t"):
+                rom_sweep.active = False
+                rom_sweep.recording = False
                 test_capture.start()
+            elif key == ord("r"):
+                test_capture.active = False
+                test_capture.pending_capture = None
+                rom_sweep.start()
             elif key == ord(" "):
                 if calibration.active:
                     capture_calibration_now(calibration, result, args.min_confidence)
@@ -1472,11 +1829,18 @@ def main() -> None:
                     )
                     test_capture.countdown_started_at = None
                     test_capture.unstable_frames = 0
+                elif rom_sweep.active:
+                    if rom_sweep.recording:
+                        save_rom_sweep(rom_sweep, args.capture_dir)
+                    else:
+                        rom_sweep.begin_recording(now)
             elif key in (27, ord("q")):
                 break
 
     cap.release()
     cv2.destroyAllWindows()
+    if not args.no_visualize_on_quit:
+        generate_visualizations_on_quit(args.capture_dir)
 
 
 if __name__ == "__main__":

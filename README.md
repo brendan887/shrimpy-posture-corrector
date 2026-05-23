@@ -80,11 +80,29 @@ python live_pose_full.py --test-window-seconds 3
 python live_pose_full.py --test-countdown-seconds 2 --test-stillness 0.06
 ```
 
+## Flexion ROM Sweep
+
+Press `r` to start the flexion range-of-motion diagnostic. The UI records one timed sweep for the left arm, then one timed sweep for the right arm:
+
+- Start with the active arm relaxed down.
+- Press `Space` to begin recording.
+- Sweep the active arm forward/up overhead as far as comfortable.
+- Return the arm back down before the timer ends.
+- Press `Space` during recording to finish early.
+
+Each sweep saves a JSON trace and key-frame PNGs for start, min flexion, max flexion, nearest 90 degrees, and end. The JSON includes `rom_summary` with min flexion, max flexion, ROM, timing of min/max, abduction cross-talk during the sweep, and valid sample counts.
+
+```bash
+python live_pose_full.py --rom-sweep-seconds 12
+```
+
 Regenerate diagnostic summary charts:
 
 ```bash
 python visualize_captures.py --capture-dir captures
 ```
+
+The app also regenerates these charts automatically when you quit. Use `--no-visualize-on-quit` if you want to skip that.
 
 Press `q` or `Esc` to quit.
 
