@@ -55,6 +55,17 @@ Each pose waits for visible landmarks and stillness, then shows a countdown befo
 
 The saved accuracy roadmap is in `docs/accuracy_plan.md`.
 
+## Diagnostic Test Capture
+
+Press `t` to start a repeatable diagnostic sequence. The UI prompts:
+
+- Arms down.
+- Arms straight in front.
+- Arms out to the side in a T.
+- Arms directly overhead.
+
+For each prompt, hold the pose still. The app shows a countdown and captures automatically. Press `Space` if you want to manually capture the current pose immediately. The app saves a PNG image plus a JSON file in `captures/`. The JSON includes the image path, view mode, calibrated/uncalibrated measurement mode, raw MediaPipe landmarks, raw/smoothed measurement vectors, and measured flexion/abduction angles for a short window before and after the capture mark. This works whether calibration is active or not.
+
 Useful options:
 
 ```bash
@@ -65,6 +76,8 @@ python live_pose_full.py --min-confidence 0.65
 python live_pose_full.py --angle-smoothing 0.15
 python live_pose_full.py --calibration-stillness 0.06
 python live_pose_full.py --view left-45
+python live_pose_full.py --test-window-seconds 3
+python live_pose_full.py --test-countdown-seconds 2 --test-stillness 0.06
 ```
 
 Press `q` or `Esc` to quit.

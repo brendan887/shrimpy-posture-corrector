@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import json
 import math
 import threading
 import time
@@ -148,6 +149,89 @@ class CalibrationState:
             self.status = f"Captured {step.name}. Next pose..."
 
 
+@dataclass(frozen=True)
+class TestStep:
+    name: str
+    instruction: str
+    expected: str
+
+
+@dataclass
+class TestCaptureState:
+    pre_seconds: float = 2.0
+    post_seconds: float = 2.0
+    countdown_seconds: float = 3.0
+    stable_frames: int = 8
+    stillness_threshold: float = 0.045
+    max_unstable_frames: int = 10
+    active: bool = False
+    current_step: int = 0
+    countdown_started_at: float | None = None
+    unstable_frames: int = 0
+    status: str = "Press t to start test capture"
+    session_id: str = ""
+    capture_index: int = 0
+    pending_capture: dict | None = None
+    post_until: float = 0.0
+    last_saved_json_path: Path | None = None
+    last_saved_image_path: Path | None = None
+    stillness_buffer: deque = field(default_factory=lambda: deque(maxlen=30))
+    steps: tuple[TestStep, ...] = (
+        TestStep(
+            "arms_down",
+            "Hold both arms relaxed straight down.",
+            "Expected: flex near 0 deg, abd near 0 deg.",
+        ),
+        TestStep(
+            "arms_forward",
+            "Hold both arms straight in front at shoulder height.",
+            "Expected: flex near 90 deg, abd near 0 deg.",
+        ),
+        TestStep(
+            "arms_side_t",
+            "Hold both arms straight out to the side like a T.",
+            "Expected: flex near 0 deg, abd near 90 deg.",
+        ),
+        TestStep(
+            "arms_overhead",
+            "Hold both arms directly overhead.",
+            "Expected: flex and/or abd near 180 deg.",
+        ),
+    )
+
+    def start(self) -> None:
+        self.active = True
+        self.current_step = 0
+        self.countdown_started_at = None
+        self.unstable_frames = 0
+        self.capture_index = 0
+        self.pending_capture = None
+        self.post_until = 0.0
+        self.last_saved_json_path = None
+        self.last_saved_image_path = None
+        self.stillness_buffer.clear()
+        self.session_id = time.strftime("%Y%m%d_%H%M%S")
+        self.status = "Test started: hold pose 1"
+
+    def step(self) -> TestStep | None:
+        if not self.active or self.current_step >= len(self.steps):
+            return None
+        return self.steps[self.current_step]
+
+    def finish_if_done(self) -> None:
+        if self.current_step >= len(self.steps) and self.pending_capture is None:
+            self.active = False
+            self.countdown_started_at = None
+            self.unstable_frames = 0
+            self.stillness_buffer.clear()
+            self.status = "Test complete. Press t to repeat."
+
+    def reset_countdown(self, status: str) -> None:
+        self.countdown_started_at = None
+        self.unstable_frames = 0
+        self.status = status
+
+
 def ensure_model(model_path: Path) -> None:
     if model_path.exists():
         return
@@ -204,6 +288,36 @@ def parse_args() -> argparse.Namespace:
         choices=VIEW_MODES,
         default="front",
         help="Camera placement hint for UI guidance. 45-degree modes still use torso-relative math.",
+    )
+    parser.add_argument(
+        "--capture-dir",
+        type=Path,
+        default=Path("captures"),
+        help="Directory for diagnostic test capture JSON files.",
+    )
+    parser.add_argument(
+        "--test-window-seconds",
+        type=float,
+        default=2.0,
+        help="Seconds before and after each test capture mark to save.",
+    )
+    parser.add_argument(
+        "--test-countdown-seconds",
+        type=float,
+        default=3.0,
+        help="Hold-still countdown before automatic diagnostic capture.",
+    )
+    parser.add_argument(
+        "--test-stillness",
+        type=float,
+        default=0.045,
+        help="Normalized image-motion tolerance for diagnostic auto-capture.",
+    )
+    parser.add_argument(
+        "--test-stable-frames",
+        type=int,
+        default=8,
+        help="Recent stable frames needed before diagnostic countdown can start.",
     )
     return parser.parse_args()
 
@@ -664,6 +778,219 @@ def angles_from_measurement_frame(frame) -> dict[str, dict[str, float | None]]:
     return angles
 
 
+def serialize_landmark(landmark) -> dict[str, float]:
+    serialized = {
+        "x": landmark.x,
+        "y": landmark.y,
+        "z": landmark.z,
+    }
+    for attr in ("visibility", "presence"):
+        value = getattr(landmark, attr, None)
+        if value is not None:
+            serialized[attr] = value
+    return serialized
+
+
+def serialize_landmark_lists(landmark_lists) -> list[list[dict[str, float]]]:
+    if not landmark_lists:
+        return []
+    return [
+        [serialize_landmark(landmark) for landmark in landmarks]
+        for landmarks in landmark_lists
+    ]
+
+
+def serialize_vector_map(vector_map) -> dict:
+    if vector_map is None:
+        return {}
+    return {
+        key: list(value) if value is not None else None
+        for key, value in vector_map.items()
+    }
+
+
+def make_diagnostic_sample(
+    *,
+    now: float,
+    result_timestamp_ms: int,
+    result,
+    angles,
+    raw_measurement_frame,
+    smoothed_measurement_frame,
+    pose_count: int,
+    view_mode: str,
+    calibration: CalibrationState,
+    test_step_name: str | None,
+    image_sample=None,
+) -> dict:
+    return {
+        "time_monotonic": now,
+        "result_timestamp_ms": result_timestamp_ms,
+        "view": view_mode,
+        "pose_count": pose_count,
+        "calibration_active": calibration.active,
+        "calibration_ready": calibration.axes is not None,
+        "test_step": test_step_name,
+        "angles": angles,
+        "image_sample": {
+            str(idx): list(value)
+            for idx, value in image_sample.items()
+        } if image_sample else None,
+        "raw_measurement_frame": serialize_vector_map(raw_measurement_frame),
+        "smoothed_measurement_frame": serialize_vector_map(smoothed_measurement_frame),
+        "pose_landmarks": serialize_landmark_lists(
+            result.pose_landmarks if result else []
+        ),
+        "pose_world_landmarks": serialize_landmark_lists(
+            result.pose_world_landmarks if result else []
+        ),
+    }
+
+
+def mark_test_capture(
+    test_capture: TestCaptureState,
+    history,
+    now: float,
+    frame,
+    output_dir: Path,
+) -> None:
+    if not test_capture.active or test_capture.pending_capture is not None:
+        return
+
+    step = test_capture.step()
+    if step is None:
+        test_capture.finish_if_done()
+        return
+
+    pre_samples = [
+        sample
+        for sample in history
+        if now - sample["time_monotonic"] <= test_capture.pre_seconds
+    ]
+    current_sample = pre_samples[-1] if pre_samples else {}
+    calibration_ready = bool(current_sample.get("calibration_ready"))
+    measurement_mode = "calibrated" if calibration_ready else "uncalibrated"
+    view_mode = current_sample.get("view")
+    output_dir.mkdir(parents=True, exist_ok=True)
+    capture_index = test_capture.capture_index + 1
+    image_path = output_dir / f"{test_capture.session_id}_{capture_index:02d}_{step.name}.png"
+    cv2.imwrite(str(image_path), frame)
+
+    test_capture.pending_capture = {
+        "session_id": test_capture.session_id,
+        "capture_index": capture_index,
+        "pose": step.name,
+        "instruction": step.instruction,
+        "expected": step.expected,
+        "view": view_mode,
+        "measurement_mode": measurement_mode,
+        "calibration_ready_at_capture": calibration_ready,
+        "marked_at": now,
+        "image_path": str(image_path),
+        "pre_seconds": test_capture.pre_seconds,
+        "post_seconds": test_capture.post_seconds,
+        "pre_samples": pre_samples,
+        "post_samples": [],
+    }
+    test_capture.countdown_started_at = None
+    test_capture.unstable_frames = 0
+    test_capture.stillness_buffer.clear()
+    test_capture.post_until = now + test_capture.post_seconds
+    test_capture.status = f"Recording {step.name} post-roll..."
+
+
+def update_test_auto_capture(
+    test_capture: TestCaptureState,
+    result,
+    visibility_threshold: float,
+    now: float,
+    history,
+    frame,
+    output_dir: Path,
+) -> None:
+    if not test_capture.active or test_capture.pending_capture is not None:
+        return
+
+    step = test_capture.step()
+    if step is None:
+        test_capture.finish_if_done()
+        return
+
+    samples = get_landmark_samples(result, visibility_threshold)
+    if samples is None:
+        test_capture.stillness_buffer.clear()
+        test_capture.reset_countdown("Waiting for shoulders, elbows, and hips")
+        return
+
+    image_sample, _world_sample = samples
+    test_capture.stillness_buffer.append(image_sample)
+    if len(test_capture.stillness_buffer) < test_capture.stable_frames:
+        test_capture.reset_countdown("Hold still")
+        return
+
+    recent = list(test_capture.stillness_buffer)[-test_capture.stable_frames:]
+    stillness = sample_stillness(recent)
+    if stillness is None or stillness > test_capture.stillness_threshold:
+        test_capture.unstable_frames += 1
+        test_capture.status = (
+            f"Hold still: movement {stillness or 0.0:.3f}"
+            f" / {test_capture.stillness_threshold:.3f}"
+        )
+        if test_capture.unstable_frames > test_capture.max_unstable_frames:
+            test_capture.countdown_started_at = None
+            test_capture.unstable_frames = 0
+        return
+
+    test_capture.unstable_frames = 0
+    if test_capture.countdown_started_at is None:
+        test_capture.countdown_started_at = now
+        test_capture.status = "Countdown started"
+        return
+
+    remaining = test_capture.countdown_seconds - (now - test_capture.countdown_started_at)
+    test_capture.status = f"Auto-capturing in {max(math.ceil(remaining), 0)}"
+    if remaining <= 0:
+        mark_test_capture(test_capture, history, now, frame, output_dir)
+        test_capture.countdown_started_at = None
+
+
+def update_test_capture(test_capture: TestCaptureState, sample: dict, output_dir: Path) -> None:
+    if test_capture.pending_capture is None:
+        return
+
+    test_capture.pending_capture["post_samples"].append(sample)
+    if sample["time_monotonic"] < test_capture.post_until:
+        return
+
+    output_dir.mkdir(parents=True, exist_ok=True)
+    test_capture.capture_index += 1
+    pose_name = test_capture.pending_capture["pose"]
+    output_path = (
+        output_dir
+        / f"{test_capture.session_id}_{test_capture.capture_index:02d}_{pose_name}.json"
+    )
+    output_path.write_text(
+        json.dumps(test_capture.pending_capture, indent=2),
+        encoding="utf-8",
+    )
+
+    test_capture.last_saved_json_path = output_path
+    image_path = test_capture.pending_capture.get("image_path")
+    test_capture.last_saved_image_path = Path(image_path) if image_path else None
+    test_capture.current_step += 1
+    test_capture.countdown_started_at = None
+    test_capture.unstable_frames = 0
+    test_capture.stillness_buffer.clear()
+    test_capture.pending_capture = None
+    next_step = test_capture.step()
+    if next_step is None:
+        test_capture.finish_if_done()
+    else:
+        test_capture.status = (
+            f"Saved {pose_name}. Next: press Space for {next_step.name}."
+        )
+
+
 def format_angle(value: float | None) -> str:
     if value is None:
         return "--"
@@ -764,13 +1091,75 @@ def draw_calibration_panel(frame, calibration: CalibrationState, view_mode: str)
         (title, 0.68, color, 2),
         (instruction, 0.52, (240, 240, 230), 1),
         (status, 0.58, (255, 230, 160), 2),
-        ("Keys: c calibrate | Space capture | q/Esc quit", 0.48, (210, 210, 200), 1),
+        ("Keys: c calibrate | t test | Space capture | q/Esc quit", 0.48, (210, 210, 200), 1),
     )
     for idx, (text, scale, text_color, thickness) in enumerate(lines):
         cv2.putText(
             frame,
             text,
             (x, y + 18 + (idx * 30)),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            scale,
+            text_color,
+            thickness,
+            cv2.LINE_AA,
+        )
+
+
+def draw_test_capture_panel(frame, test_capture: TestCaptureState) -> None:
+    if not test_capture.active and test_capture.last_saved_json_path is None:
+        return
+
+    height, width = frame.shape[:2]
+    panel_width, panel_height = 620, 128
+    x = max(width - panel_width - 24, 24)
+    y = max(height - panel_height - 24, 24)
+
+    overlay = frame.copy()
+    cv2.rectangle(
+        overlay,
+        (x - 10, y - 12),
+        (x + panel_width, y + panel_height),
+        (12, 18, 34),
+        -1,
+    )
+    cv2.addWeighted(overlay, 0.64, frame, 0.36, 0, frame)
+
+    step = test_capture.step()
+    if test_capture.pending_capture is not None:
+        title = "Test capture recording"
+        instruction = test_capture.pending_capture["instruction"]
+        expected = test_capture.pending_capture["expected"]
+        status = test_capture.status
+        color = (80, 220, 255)
+    elif step is not None:
+        title = f"Test {test_capture.current_step + 1}/{len(test_capture.steps)}: {step.name}"
+        instruction = step.instruction
+        expected = step.expected
+        status = f"{test_capture.status} | Space captures now"
+        color = (80, 220, 255)
+    else:
+        title = "Test capture complete"
+        instruction = "Press t to repeat the diagnostic sequence."
+        expected = (
+            f"Last saved: {test_capture.last_saved_json_path}"
+            if test_capture.last_saved_json_path
+            else "No capture saved yet."
+        )
+        status = test_capture.status
+        color = (40, 255, 120)
+
+    lines = (
+        (title, 0.66, color, 2),
+        (instruction, 0.54, (240, 240, 250), 1),
+        (expected, 0.48, (205, 220, 255), 1),
+        (status, 0.54, (255, 230, 160), 2),
+    )
+    for idx, (text, scale, text_color, thickness) in enumerate(lines):
+        cv2.putText(
+            frame,
+            text[:95],
+            (x, y + 18 + (idx * 29)),
             cv2.FONT_HERSHEY_SIMPLEX,
             scale,
             text_color,
@@ -827,6 +1216,15 @@ def main() -> None:
     calibration.stillness_threshold = args.calibration_stillness
     calibration.stable_frames = max(args.calibration_stable_frames, 2)
     calibration.landmark_buffer = deque(maxlen=max(calibration.stable_frames * 3, 30))
+    test_capture = TestCaptureState(
+        pre_seconds=args.test_window_seconds,
+        post_seconds=args.test_window_seconds,
+        countdown_seconds=args.test_countdown_seconds,
+        stable_frames=max(args.test_stable_frames, 2),
+        stillness_threshold=args.test_stillness,
+    )
+    test_capture.stillness_buffer = deque(maxlen=max(test_capture.stable_frames * 3, 30))
+    diagnostic_history = deque(maxlen=max(int(args.test_window_seconds * 90), 180))
     smoothed_measurement_frame = None
     missing_measurement_frames = 0
 
@@ -875,8 +1273,35 @@ def main() -> None:
                     measurement_frame,
                     smoothed_measurement_frame,
                     args.angle_smoothing,
-                )
+            )
             angles = angles_from_measurement_frame(smoothed_measurement_frame)
+            active_test_step = test_capture.step()
+            landmark_samples = get_landmark_samples(result, args.min_confidence)
+            image_sample = landmark_samples[0] if landmark_samples else None
+            diagnostic_sample = make_diagnostic_sample(
+                now=now,
+                result_timestamp_ms=result_timestamp_ms,
+                result=result,
+                angles=angles,
+                raw_measurement_frame=measurement_frame,
+                smoothed_measurement_frame=smoothed_measurement_frame,
+                pose_count=pose_count,
+                view_mode=args.view,
+                calibration=calibration,
+                test_step_name=active_test_step.name if active_test_step else None,
+                image_sample=image_sample,
+            )
+            diagnostic_history.append(diagnostic_sample)
+            update_test_auto_capture(
+                test_capture,
+                result,
+                args.min_confidence,
+                now,
+                diagnostic_history,
+                frame,
+                args.capture_dir,
+            )
+            update_test_capture(test_capture, diagnostic_sample, args.capture_dir)
 
             instantaneous_fps = 1.0 / max(now - previous_frame_time, 1e-6)
             fps = instantaneous_fps if fps == 0.0 else (fps * 0.9) + (instantaneous_fps * 0.1)
@@ -904,6 +1329,7 @@ def main() -> None:
             )
             draw_angle_panel(frame, angles)
             draw_calibration_panel(frame, calibration, args.view)
+            draw_test_capture_panel(frame, test_capture)
 
             cv2.imshow("Shrimpy Pose MVP", frame)
             key = cv2.waitKey(1) & 0xFF
@@ -911,10 +1337,23 @@ def main() -> None:
                 calibration.start()
                 smoothed_measurement_frame = None
                 missing_measurement_frames = 0
+            elif key == ord("t"):
+                test_capture.start()
             elif key == ord(" "):
-                capture_calibration_now(calibration, result, args.min_confidence)
-                smoothed_measurement_frame = None
-                missing_measurement_frames = 0
+                if calibration.active:
+                    capture_calibration_now(calibration, result, args.min_confidence)
+                    smoothed_measurement_frame = None
+                    missing_measurement_frames = 0
+                elif test_capture.active:
+                    mark_test_capture(
+                        test_capture,
+                        diagnostic_history,
+                        now,
+                        frame,
+                        args.capture_dir,
+                    )
+                    test_capture.countdown_started_at = None
+                    test_capture.unstable_frames = 0
             elif key in (27, ord("q")):
                 break
 
