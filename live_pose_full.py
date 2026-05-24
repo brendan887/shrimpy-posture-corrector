@@ -517,6 +517,22 @@ def image_plane_flexion_angle(shoulder, distal) -> float | None:
     return angle
 
 
+def image_plane_elbow_angle(shoulder, elbow, wrist) -> float | None:
+    if shoulder is None or elbow is None or wrist is None:
+        return None
+
+    upper = (shoulder.x - elbow.x, shoulder.y - elbow.y)
+    forearm = (wrist.x - elbow.x, wrist.y - elbow.y)
+    upper_norm = math.hypot(*upper)
+    forearm_norm = math.hypot(*forearm)
+    if upper_norm < 1e-6 or forearm_norm < 1e-6:
+        return None
+
+    dot = (upper[0] * forearm[0]) + (upper[1] * forearm[1])
+    cosine = min(max(dot / (upper_norm * forearm_norm), -1.0), 1.0)
+    return math.degrees(math.acos(cosine))
+
+
 def v_lerp(a, b, alpha: float):
     return (
         (alpha * a[0]) + ((1.0 - alpha) * b[0]),
@@ -1054,6 +1070,7 @@ def image_plane_angles_from_result(result, arm_name: str) -> dict:
         "convention": "0_down_90_left_180_up",
         "humerus_flexion": image_plane_flexion_angle(shoulder, elbow),
         "reach_flexion": image_plane_flexion_angle(shoulder, hand or wrist or elbow),
+        "elbow_angle": image_plane_elbow_angle(shoulder, elbow, wrist),
         "confidence": min(confidences) if confidences else None,
     }
 

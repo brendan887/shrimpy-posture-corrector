@@ -93,9 +93,9 @@ def format_angle(value: float | None) -> str:
     return f"{value:5.1f}"
 
 
-def draw_angle_panel(frame, angles, image_plane_angles=None) -> None:
+def draw_angle_panel(frame, angles, image_plane_angles=None, now: float = 0.0) -> None:
     image_plane_angles = image_plane_angles or {}
-    panel_width, panel_height = 560, 172
+    panel_width, panel_height = 690, 172
     x, y = 24, 92 + int(panel_height * 0.25)
     overlay = frame.copy()
     cv2.rectangle(
@@ -157,6 +157,26 @@ def draw_angle_panel(frame, angles, image_plane_angles=None) -> None:
             cv2.FONT_HERSHEY_SIMPLEX,
             0.56,
             (110, 235, 255),
+            2,
+            cv2.LINE_AA,
+        )
+        elbow_angle = image_angles.get("elbow_angle")
+        elbow_warning = elbow_angle is not None and elbow_angle < 130.0
+        flash_on = int(now * 4) % 2 == 0
+        elbow_color = (
+            (40, 40, 255)
+            if elbow_warning and flash_on
+            else (80, 80, 150)
+            if elbow_warning
+            else (110, 235, 255)
+        )
+        cv2.putText(
+            frame,
+            f"   elbow {format_angle(elbow_angle)} deg",
+            (x + 350, row_y + 24),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.56,
+            elbow_color,
             2,
             cv2.LINE_AA,
         )
@@ -443,7 +463,7 @@ def render_frame(
 ) -> None:
     draw_pose(frame, result, visibility_threshold)
     draw_status(frame, view_mode, pose_count, fps, result_timestamp_ms)
-    draw_angle_panel(frame, angles, image_plane_angles)
+    draw_angle_panel(frame, angles, image_plane_angles, now)
     draw_calibration_panel(frame, calibration, view_mode)
     draw_test_capture_panel(frame, test_capture)
     draw_rom_panel(frame, rom, now)
