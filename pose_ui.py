@@ -12,19 +12,19 @@ VIEW_GUIDANCE = {
     },
     "left-45": {
         "title": "Left 45-degree mode",
-        "instruction": "Place camera at your left-front 45 deg angle. ROM sweep uses the camera-side R landmark arm.",
+        "instruction": "Place camera at your left-front 45 deg angle. ROM defaults to camera-side R; arrows can switch.",
     },
     "right-45": {
         "title": "Right 45-degree mode",
-        "instruction": "Place camera at your right-front 45 deg angle. ROM sweep uses the camera-side L landmark arm.",
+        "instruction": "Place camera at your right-front 45 deg angle. ROM defaults to camera-side L; arrows can switch.",
     },
     "left-side": {
         "title": "Left side-view mode",
-        "instruction": "Place camera near your left side. ROM sweep uses the camera-side R landmark arm.",
+        "instruction": "Place camera near your left side. ROM defaults to camera-side R; arrows can switch.",
     },
     "right-side": {
         "title": "Right side-view mode",
-        "instruction": "Place camera near your right side. ROM sweep uses the camera-side L landmark arm.",
+        "instruction": "Place camera near your right side. ROM defaults to camera-side L; arrows can switch.",
     },
 }
 
@@ -296,7 +296,7 @@ def draw_rom_panel(frame, rom, now: float) -> None:
     elif step is not None:
         title = f"ROM sweep {rom.current_step + 1}/{len(rom.steps)}: {step.arm} arm"
         instruction = step.instruction
-        expected = "Press Space to start; press Space again when the sweep is complete."
+        expected = "Left/Right arrows select arm. Space starts; Space again saves."
         status = rom.status
         color = (190, 120, 255)
     else:

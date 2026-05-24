@@ -30,6 +30,8 @@ ROM_LANDMARKS = {
     "L": {"shoulder": 11, "elbow": 13, "wrist": 15, "index": 19, "pinky": 17},
     "R": {"shoulder": 12, "elbow": 14, "wrist": 16, "index": 20, "pinky": 18},
 }
+LEFT_ARROW_KEYS = {81, 2424832, 63234}
+RIGHT_ARROW_KEYS = {83, 2555904, 63235}
 
 
 @dataclass(frozen=True)
@@ -208,40 +210,34 @@ class ROMSweepStep:
     instruction: str
 
 
-def rom_steps_for_view(view_mode: str) -> tuple[ROMSweepStep, ...]:
+def default_rom_arm_for_view(view_mode: str) -> str:
     # The image is mirrored before MediaPipe inference, so the camera-side
     # landmark label is opposite the physical side-view name.
     camera_side_by_view = {
-        "right-45": ("L", "right-front diagonal"),
-        "right-side": ("L", "right side"),
-        "left-45": ("R", "left-front diagonal"),
-        "left-side": ("R", "left side"),
+        "right-45": "L",
+        "right-side": "L",
+        "left-45": "R",
+        "left-side": "R",
     }
-    selected = camera_side_by_view.get(view_mode)
-    if selected is not None:
-        arm, view_label = selected
-        return (
-            ROMSweepStep(
-                f"{view_mode.replace('-', '_')}_camera_side_flexion_sweep",
-                arm,
-                (
-                    f"Camera-side arm only ({arm} landmark, {view_label} view): "
-                    "start down, sweep forward/up overhead, continue behind head, then press Space to stop."
-                ),
-            ),
-        )
+    return camera_side_by_view.get(view_mode, "L")
 
+
+def rom_step_for_arm(view_mode: str, arm: str) -> ROMSweepStep:
+    view_slug = view_mode.replace("-", "_")
+    arm_slug = "left" if arm == "L" else "right"
+    return ROMSweepStep(
+        f"{view_slug}_{arm_slug}_flexion_sweep",
+        arm,
+        (
+            f"{arm} landmark arm: start down, sweep forward/up overhead, "
+            "continue behind head, then press Space to stop."
+        ),
+    )
+
+
+def rom_steps_for_view(view_mode: str) -> tuple[ROMSweepStep, ...]:
     return (
-        ROMSweepStep(
-            "left_flexion_sweep",
-            "L",
-            "Left landmark arm only: start down, sweep forward/up overhead, continue behind head, then press Space to stop.",
-        ),
-        ROMSweepStep(
-            "right_flexion_sweep",
-            "R",
-            "Right landmark arm only: start down, sweep forward/up overhead, continue behind head, then press Space to stop.",
-        ),
+        rom_step_for_arm(view_mode, default_rom_arm_for_view(view_mode)),
     )
 
 
@@ -255,6 +251,7 @@ class ROMSweepState:
     capture_index: int = 0
     started_at: float = 0.0
     view_mode: str = "front"
+    selected_arm: str = "L"
     status: str = "Press r to start ROM sweep"
     samples: list[dict] = field(default_factory=list)
     key_frames: dict[str, dict] = field(default_factory=dict)
@@ -278,6 +275,7 @@ class ROMSweepState:
         self.active = True
         self.recording = False
         self.view_mode = view_mode
+        self.selected_arm = default_rom_arm_for_view(view_mode)
         self.steps = rom_steps_for_view(view_mode)
         self.current_step = 0
         self.capture_index = 0
@@ -291,15 +289,27 @@ class ROMSweepState:
         step = self.step()
         if step is None:
             self.status = "No ROM sweep configured for this view."
-        elif len(self.steps) == 1:
-            self.status = f"ROM test started for {view_mode}. Press Space to record the camera-side arm."
+        elif view_mode == "front":
+            self.status = f"ROM test started. Arrows select arm; Space records {self.selected_arm}."
         else:
-            self.status = "ROM test started. Press Space to record the first arm."
+            self.status = f"ROM test started for {view_mode}. Arrows select arm; Space records {self.selected_arm}."
 
     def step(self) -> ROMSweepStep | None:
         if not self.active or self.current_step >= len(self.steps):
             return None
         return self.steps[self.current_step]
+
+    def select_arm(self, arm: str) -> None:
+        if arm not in {"L", "R"} or self.recording:
+            return
+        self.selected_arm = arm
+        self.steps = (rom_step_for_arm(self.view_mode, arm),)
+        self.current_step = 0
+        self.samples.clear()
+        self.key_frames.clear()
+        self.frame_samples.clear()
+        self.last_image_plane_angles = None
+        self.status = f"Selected {arm} landmark arm. Press Space to record."
 
     def begin_recording(self, now: float) -> None:
         step = self.step()
@@ -2044,8 +2054,13 @@ def main() -> None:
             )
 
             cv2.imshow("Shrimpy Pose MVP", frame)
-            key = cv2.waitKey(1) & 0xFF
-            if key == ord("c"):
+            raw_key = cv2.waitKeyEx(1)
+            key = raw_key & 0xFF
+            if raw_key in LEFT_ARROW_KEYS and rom_sweep.active and not rom_sweep.recording:
+                rom_sweep.select_arm("L")
+            elif raw_key in RIGHT_ARROW_KEYS and rom_sweep.active and not rom_sweep.recording:
+                rom_sweep.select_arm("R")
+            elif key == ord("c"):
                 calibration.start()
                 smoothed_measurement_frame = None
                 missing_measurement_frames = 0

@@ -82,15 +82,16 @@ python live_pose_full.py --test-countdown-seconds 2 --test-stillness 0.06
 
 ## Flexion ROM Sweep
 
-Press `r` to start the flexion range-of-motion diagnostic. For side and 45-degree views, the UI records only the arm closest to the camera. For front view, it records one sweep for each landmark arm because neither arm is camera-side.
+Press `r` to start the flexion range-of-motion diagnostic. For side and 45-degree views, the UI defaults to the arm closest to the camera. Use the Left/Right arrow keys to choose which landmark arm is captured, regardless of camera view.
 
 - Start with the active arm relaxed down.
+- Use Left/Right arrows to select the arm to capture.
 - Press `Space` to begin recording.
 - Sweep the active arm forward/up overhead as far as comfortable, including behind the head if that is the ROM you want to measure.
 - Hold briefly at interesting points if useful.
 - Press `Space` again to stop and save the sweep.
 
-Because the app mirrors the webcam image before MediaPipe inference, the camera-side landmark label is opposite the side-view name: `right-side` and `right-45` record the `L` landmark arm, while `left-side` and `left-45` record the `R` landmark arm. This matches the side-view captures we have been diagnosing.
+Because the app mirrors the webcam image before MediaPipe inference, the default camera-side landmark label is opposite the side-view name: `right-side` and `right-45` default to the `L` landmark arm, while `left-side` and `left-45` default to the `R` landmark arm. You can override this with the arrow keys before pressing `Space`.
 
 Each sweep saves a JSON trace and key-frame PNGs for start, min flexion, max flexion, nearest 90 degrees, and end. The JSON includes:
 
