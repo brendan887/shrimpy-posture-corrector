@@ -320,6 +320,71 @@ def draw_rom_panel(frame, rom, now: float) -> None:
     draw_lines(frame, lines, x, y, line_height=28, truncate=105)
 
 
+PHASE_LABELS = {
+    "disconnected": ("ROBOT OFFLINE", (120, 120, 140)),
+    "at_home": ("AT HOME", (180, 180, 180)),
+    "moving_to_start": ("MOVING TO START", (80, 220, 255)),
+    "at_start": ("AT START - awaiting auth", (120, 220, 255)),
+    "executing": ("EXECUTING", (40, 255, 120)),
+    "at_end": ("AT END - awaiting auth", (255, 200, 80)),
+    "returning_home": ("RETURNING HOME", (80, 220, 255)),
+    "aborted": ("ABORTED", (60, 80, 255)),
+}
+
+
+def draw_robot_panel(frame, robot_state, now: float) -> None:
+    if robot_state is None:
+        return
+
+    _height, width = frame.shape[:2]
+    panel_width, panel_height = 460, 138
+    x = max(width - panel_width - 24, 24)
+    y = 24 + 138 + 16
+
+    overlay = frame.copy()
+    cv2.rectangle(
+        overlay,
+        (x - 10, y - 12),
+        (x + panel_width, y + panel_height),
+        (14, 28, 22),
+        -1,
+    )
+    cv2.addWeighted(overlay, 0.64, frame, 0.36, 0, frame)
+
+    dot_color = (40, 255, 120) if robot_state.connected else (60, 80, 255)
+    cv2.circle(frame, (x + 8, y + 4), 7, dot_color, -1, cv2.LINE_AA)
+
+    capture = robot_state.capture_name or "(no capture selected)"
+    header = f"  ROBOT: {capture}"
+
+    phase_label, phase_color = PHASE_LABELS.get(
+        robot_state.phase, (robot_state.phase.upper(), (220, 220, 220))
+    )
+
+    if robot_state.target:
+        detail_line = f"target: {robot_state.target}"
+    elif robot_state.step:
+        detail_line = f"step: {robot_state.step}"
+    elif robot_state.detail:
+        detail_line = robot_state.detail
+    else:
+        detail_line = ""
+
+    if robot_state.last_event_at > 0:
+        age = max(now - robot_state.last_event_at, 0.0)
+        age_line = f"last event: {age:5.1f}s ago"
+    else:
+        age_line = "last event: --"
+
+    lines = (
+        (header, 0.62, (220, 245, 230), 2),
+        (phase_label, 0.78, phase_color, 2),
+        (detail_line, 0.52, (220, 230, 220), 1),
+        (age_line, 0.46, (170, 190, 175), 1),
+    )
+    draw_lines(frame, lines, x, y, line_height=28, truncate=58)
+
+
 def draw_lines(frame, lines, x: int, y: int, line_height: int = 30, truncate: int | None = None) -> None:
     for idx, (text, scale, text_color, thickness) in enumerate(lines):
         if truncate is not None:
@@ -374,6 +439,7 @@ def render_frame(
     fps: float,
     result_timestamp_ms: int,
     now: float,
+    robot_state=None,
 ) -> None:
     draw_pose(frame, result, visibility_threshold)
     draw_status(frame, view_mode, pose_count, fps, result_timestamp_ms)
@@ -381,3 +447,4 @@ def render_frame(
     draw_calibration_panel(frame, calibration, view_mode)
     draw_test_capture_panel(frame, test_capture)
     draw_rom_panel(frame, rom, now)
+    draw_robot_panel(frame, robot_state, now)

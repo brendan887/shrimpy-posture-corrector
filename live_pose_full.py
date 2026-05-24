@@ -14,6 +14,7 @@ from statistics import mean, median, pstdev
 import cv2
 import mediapipe as mp
 
+from bridge import DEFAULT_HOST, DEFAULT_PORT, StatusClient
 from pose_ui import VIEW_MODES, render_frame
 
 
@@ -423,6 +424,28 @@ def parse_args() -> argparse.Namespace:
         type=float,
         default=10.0,
         help="Deprecated. ROM sweeps now record until Space is pressed again.",
+    )
+    parser.add_argument(
+        "--rom-arm",
+        choices=("L", "R"),
+        default=None,
+        help="Pre-select the ROM sweep arm without using the left/right arrow keys.",
+    )
+    parser.add_argument(
+        "--robot-host",
+        default=DEFAULT_HOST,
+        help="Host where the piper_sequence status server is running.",
+    )
+    parser.add_argument(
+        "--robot-port",
+        type=int,
+        default=DEFAULT_PORT,
+        help="Port for the piper_sequence status server.",
+    )
+    parser.add_argument(
+        "--no-robot",
+        action="store_true",
+        help="Disable the robot status client (no connection attempts, no panel).",
     )
     parser.add_argument(
         "--no-visualize-on-quit",
@@ -854,13 +877,19 @@ def angles_from_measurement_frame(frame) -> dict[str, dict[str, float | None]]:
             angles[arm_name] = {"flexion": None, "abduction": None}
             continue
 
+        # Flexion shares one plane_normal across both arms, so the raw signed
+        # angle is mirrored on L. Negate L so both arms read +90 forward.
+        flexion_value = signed_plane_angle(
+            upper_arm,
+            zero_axis=frame["down"],
+            positive_axis=frame["forward"],
+            plane_normal=frame["right"],
+        )
+        if arm_name == "L" and flexion_value is not None:
+            flexion_value = -flexion_value
+
         angles[arm_name] = {
-            "flexion": signed_plane_angle(
-                upper_arm,
-                zero_axis=frame["down"],
-                positive_axis=frame["forward"],
-                plane_normal=frame["right"],
-            ),
+            "flexion": flexion_value,
             "abduction": signed_plane_angle(
                 upper_arm,
                 zero_axis=frame["down"],
@@ -1893,6 +1922,13 @@ def main() -> None:
         print(f"Model ready: {args.model}")
         return
 
+    robot_client = None
+    if not args.no_robot:
+        robot_client = StatusClient(host=args.robot_host, port=args.robot_port)
+        robot_client.start()
+        print(f"[bridge] Robot status client connecting to "
+              f"{args.robot_host}:{args.robot_port} (--no-robot to disable)")
+
     BaseOptions = mp.tasks.BaseOptions
     PoseLandmarker = mp.tasks.vision.PoseLandmarker
     PoseLandmarkerOptions = mp.tasks.vision.PoseLandmarkerOptions
@@ -1926,7 +1962,8 @@ def main() -> None:
 
     cap.set(cv2.CAP_PROP_FRAME_WIDTH, args.width)
     cap.set(cv2.CAP_PROP_FRAME_HEIGHT, args.height)
-
+    cv2.namedWindow("Shrimpy Pose MVP", cv2.WINDOW_NORMAL)
+    cv2.setWindowProperty("Shrimpy Pose MVP", cv2.WND_PROP_FULLSCREEN, cv2.WINDOW_FULLSCREEN)
     last_timestamp_ms = 0
     previous_frame_time = time.perf_counter()
     fps = 0.0
@@ -2051,6 +2088,7 @@ def main() -> None:
                 fps=fps,
                 result_timestamp_ms=result_timestamp_ms,
                 now=now,
+                robot_state=robot_client.snapshot() if robot_client else None,
             )
 
             cv2.imshow("Shrimpy Pose MVP", frame)
@@ -2072,6 +2110,8 @@ def main() -> None:
                 test_capture.active = False
                 test_capture.pending_capture = None
                 rom_sweep.start(args.view)
+                if args.rom_arm is not None:
+                    rom_sweep.select_arm(args.rom_arm)
             elif key == ord(" "):
                 if calibration.active:
                     capture_calibration_now(calibration, result, args.min_confidence)

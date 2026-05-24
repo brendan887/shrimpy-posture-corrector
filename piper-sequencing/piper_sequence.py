@@ -1,6 +1,12 @@
 import math
+import os
+import sys
 import time
 
+# bridge.py lives in the project root, one level above piper-sequencing/.
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
+from bridge import StatusServer
 from piper_sdk import C_PiperInterface_V2
 
 RAD_TO_MDEG = 1000 * 180 / math.pi
@@ -126,7 +132,7 @@ def wait_with_force_check(piper: C_PiperInterface_V2,
 
 
 def main() -> None:
-    _, cap = choose_capture()
+    capture_key, cap = choose_capture()
     sequence = cap["sequence"]
     if not sequence:
         print(f"\n'{cap['name']}' has no poses recorded yet. "
@@ -134,12 +140,22 @@ def main() -> None:
         return
     print(f"\nSelected: {cap['name']} — {len(sequence)} step(s).")
 
+    bus = StatusServer()
+    bus.start()
+    bus.send(
+        "capture_selected",
+        capture=capture_key,
+        name=cap["name"],
+        sequence=[step[0] for step in sequence],
+    )
+
     piper = C_PiperInterface_V2("can0")
     piper.ConnectPort()
     print("Enabling arm...")
     while not piper.EnablePiper():
         time.sleep(0.01)
     print("Arm enabled.")
+    bus.send("at_home", detail="Arm enabled, awaiting start auth.")
 
     # Clear any residual trajectory state from a prior force-abort
     # (track_ctrl=0x04 = "clear all trajectories"). No effect on motors,
@@ -192,8 +208,11 @@ def main() -> None:
     first_name, first_pose = sequence[0][0], sequence[0][1]
     input(f"Press Enter to start session (arm will move to "
           f"'{first_name}' position)...")
+    bus.send("moving_to_start", target=first_name)
     if not run_move(first_name, first_pose, monitor=False):
+        bus.send("aborted", step=first_name, detail="Start move failed.")
         return
+    bus.send("at_start", step=first_name)
 
     # 2. Auth at the first step → auto-execute all remaining steps in order.
     if len(sequence) > 1:
@@ -201,18 +220,24 @@ def main() -> None:
               f"Press Enter to begin the workout sequence...")
         for step in sequence[1:]:
             step_name, pose = step[0], step[1]
+            bus.send("executing", step=step_name)
             if not run_move(step_name, pose, FORCE_MONITORING):
+                bus.send("aborted", step=step_name, detail="Workout step failed.")
                 return
 
     # 3. Auth at the last step → arm returns to home, ending the session.
     last_name = sequence[-1][0]
     home = cap.get("home")
+    bus.send("at_end", step=last_name)
     if home is not None:
         input(f"At '{last_name}' position. "
               f"Press Enter to end session and return to home...")
+        bus.send("returning_home")
         if not run_move("home", home, FORCE_MONITORING):
+            bus.send("aborted", step="home", detail="Home return failed.")
             return
         print("Session ended. Arm at home position.")
+        bus.send("at_home", detail="Session ended.")
     else:
         print("Sequence complete.")
 
