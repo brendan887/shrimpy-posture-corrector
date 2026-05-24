@@ -8,6 +8,7 @@ import time
 import urllib.request
 from collections import deque
 from dataclasses import dataclass, field
+from typing import ClassVar
 from pathlib import Path
 from statistics import mean, median, pstdev
 
@@ -15,7 +16,7 @@ import cv2
 import mediapipe as mp
 
 from bridge import DEFAULT_HOST, DEFAULT_PORT, StatusClient
-from pose_ui import VIEW_MODES, render_frame
+from pose_ui import VIEW_MODES, _detect_screen_size, render_frame
 
 
 MODEL_URL = (
@@ -1932,6 +1933,282 @@ def generate_visualizations_on_quit(capture_dir: Path) -> None:
         print(f"Could not generate capture visualizations: {exc}")
 
 
+@dataclass
+class WorkflowState:
+    """Five-step patient workflow:
+        1. Ready position           (Space -> 2)
+        2. Baseline arm raise       (Space -> 3, only after a stable 3s hold)
+        3. Grab the robot handle    (Space -> 4)
+        4. Robot-assisted stretch   (Space -> 5, only after a stable 3s hold)
+        5. Results / comparison     (Space -> 1, restart)
+
+    Steps 2 and 4 watch the left-arm 2D flexion angle (camera is mirrored,
+    so the patient's left arm reads on what looks like the right side of the
+    screen), detect a >=3s stable hold (range within STABILITY_TOL_DEG), and
+    capture the peak stable mean. The robot script still operates on the
+    right-arm sequence — only the camera-side measurement was swapped.
+    """
+    HOLD_SECONDS: ClassVar[float] = 3.0
+    STABILITY_TOL_DEG: ClassVar[float] = 4.0
+
+    step: int = 1
+    angle_buffer: deque = field(default_factory=lambda: deque(maxlen=300))
+    peak_during_step: float | None = None
+    last_stable_angle: float | None = None
+    baseline_angle: float | None = None
+    assisted_angle: float | None = None
+
+    def reset_capture(self) -> None:
+        self.angle_buffer.clear()
+        self.peak_during_step = None
+        self.last_stable_angle = None
+
+    def update(self, now: float, angle: float | None) -> None:
+        if self.step not in (2, 4):
+            return
+        if angle is None:
+            self.angle_buffer.clear()
+            self.last_stable_angle = None
+            return
+
+        cutoff = now - self.HOLD_SECONDS
+        while self.angle_buffer and self.angle_buffer[0][0] < cutoff:
+            self.angle_buffer.popleft()
+        self.angle_buffer.append((now, angle))
+
+        if not self.angle_buffer:
+            self.last_stable_angle = None
+            return
+        oldest_ts = self.angle_buffer[0][0]
+        if now - oldest_ts < self.HOLD_SECONDS - 0.05:
+            self.last_stable_angle = None
+            return
+
+        values = [a for _, a in self.angle_buffer]
+        if max(values) - min(values) <= self.STABILITY_TOL_DEG:
+            stable_value = sum(values) / len(values)
+            self.last_stable_angle = stable_value
+            if self.peak_during_step is None or stable_value > self.peak_during_step:
+                self.peak_during_step = stable_value
+        else:
+            self.last_stable_angle = None
+
+    def hold_progress(self, now: float) -> float:
+        """0..1 fraction of HOLD_SECONDS spent under the stability tolerance."""
+        if self.step not in (2, 4) or not self.angle_buffer:
+            return 0.0
+        values = [a for _, a in self.angle_buffer]
+        if max(values) - min(values) > self.STABILITY_TOL_DEG:
+            return 0.0
+        oldest_ts = self.angle_buffer[0][0]
+        return min(1.0, (now - oldest_ts) / self.HOLD_SECONDS)
+
+    def can_advance(self) -> bool:
+        if self.step in (1, 3, 5):
+            return True
+        return self.peak_during_step is not None
+
+    def advance(self, now: float) -> bool:
+        if not self.can_advance():
+            return False
+        if self.step == 2:
+            self.baseline_angle = self.peak_during_step
+            self.reset_capture()
+            self.step = 3
+        elif self.step == 4:
+            self.assisted_angle = self.peak_during_step
+            self.reset_capture()
+            self.step = 5
+        elif self.step == 5:
+            self.baseline_angle = None
+            self.assisted_angle = None
+            self.reset_capture()
+            self.step = 1
+        else:
+            self.reset_capture()
+            self.step += 1
+        return True
+
+
+WORKFLOW_STEP_TITLES = (
+    "Sit in ready position",
+    "Baseline arm raise",
+    "Grab the handle",
+    "Robot-assisted stretch",
+    "Compare results",
+)
+
+
+def workflow_state_to_ui(
+    workflow: WorkflowState,
+    *,
+    image_plane_angles: dict,
+    robot_state,
+    now: float,
+    dev_overlay: str = "",
+):
+    """Build a UIState describing the current workflow step."""
+    from pose_ui import (
+        AngleReading, ChecklistItem, ComparisonRow, ROBOT_PHASE_LABELS, UIState, C,
+    )
+
+    state = UIState()
+    state.dev_overlay = dev_overlay
+    state.step_total = len(WORKFLOW_STEP_TITLES)
+    state.step_index = workflow.step - 1
+
+    # Header accent by step
+    state.phase = {1: 0, 2: 1, 3: 1, 4: 2, 5: 3}.get(workflow.step, 1)
+
+    # Live angle readout: left-arm humerus 2D flexion (image plane).
+    # Camera is mirrored, so the patient's left arm is the one they raise on
+    # the visually-right side of the screen.
+    l_2d = (image_plane_angles.get("L", {}) or {}).get("humerus_flexion")
+    overlay_status = "live"
+    if workflow.step in (2, 4) and workflow.last_stable_angle is not None:
+        overlay_status = "hold"
+    state.angles = [
+        AngleReading("Flexion (2D)", "L", l_2d, target_min=120, status=overlay_status),
+    ]
+
+    # Checklist
+    state.checklist = []
+    for i, title in enumerate(WORKFLOW_STEP_TITLES, start=1):
+        if i < workflow.step:
+            status = "done"
+        elif i == workflow.step:
+            status = "active"
+        else:
+            status = "pending"
+        state.checklist.append(ChecklistItem(title, status))
+
+    # Helpers shared by step 2 and 4
+    def _capture_footer_and_overlays(step_label: str, locked_label: str,
+                                     next_label: str) -> None:
+        progress = workflow.hold_progress(now)
+        peak = workflow.peak_during_step
+        if peak is not None:
+            state.footer_hint = (
+                f"{locked_label}: {peak:.0f}°   ·   "
+                f"Space to {next_label} (hold longer to update peak)"
+            )
+            state.big_callout = f"PEAK: {peak:.0f}°"
+            state.big_callout_color = C.SUCCESS
+        elif progress >= 1.0:
+            state.footer_hint = "Stable — capturing peak…"
+            state.countdown_seconds = 0.0
+            state.countdown_label = step_label
+        elif progress > 0:
+            remaining = workflow.HOLD_SECONDS * (1.0 - progress)
+            state.footer_hint = (
+                f"Hold steady — {remaining:0.1f}s left of the 3-second hold"
+            )
+            state.countdown_seconds = remaining
+            state.countdown_label = step_label
+        else:
+            state.footer_hint = (
+                "Raise your arm and hold steady for 3 seconds to capture"
+            )
+
+    if workflow.step == 1:
+        state.hero_kicker = "Step 1 · Ready position"
+        state.hero_title = "Sit down and face the camera"
+        state.hero_bullets = [
+            "Sit upright with both feet flat on the floor",
+            "Rest your back on the chair",
+            "Relax your arms loosely at your sides",
+            "Face the camera so your full upper body is visible",
+        ]
+        state.footer_hint = "Press Space when you're ready to begin"
+
+    elif workflow.step == 2:
+        state.hero_kicker = "Step 2 · Baseline arm raise"
+        state.hero_title = "Raise your left arm to your natural limit"
+        state.hero_bullets = [
+            "Raise your left arm in a relaxed motion",
+            "Hold at your natural limit for 3 seconds",
+            "We capture your highest stable angle automatically",
+            "Press Space to lock in your baseline and continue",
+        ]
+        _capture_footer_and_overlays(
+            step_label="Hold steady",
+            locked_label="Baseline",
+            next_label="continue",
+        )
+
+    elif workflow.step == 3:
+        state.hero_kicker = "Step 3 · Grab the handle"
+        state.hero_title = "Reach forward and grab the robot handle"
+        state.hero_bullets = [
+            "Stand or sit within reach of the robot arm",
+            "Wrap your hand firmly around the handle",
+            "Keep your grip relaxed but secure",
+            "Press Space when you're ready for the assisted stretch",
+        ]
+        state.footer_hint = "Press Space when ready"
+
+    elif workflow.step == 4:
+        state.hero_kicker = "Step 4 · Robot-assisted stretch"
+        state.hero_title = "Let the robot guide your left arm up"
+        state.hero_bullets = [
+            "Stay relaxed and follow the robot's motion",
+            "We start capturing when the robot reaches the end of its sweep",
+            "Hold at the stretched position for 3 seconds",
+            "Press Space to lock in the assisted measurement",
+        ]
+        rp = getattr(robot_state, "phase", "") if robot_state is not None else ""
+        connected = (robot_state is not None and getattr(robot_state, "connected", False))
+        at_end = (rp == "at_end")
+        if connected:
+            cap_name = getattr(robot_state, "capture_name", None) or "(no capture)"
+            state.robot_state = (
+                f"{cap_name}  ·  {ROBOT_PHASE_LABELS.get(rp, rp) or 'idle'}"
+            )
+        if not at_end:
+            # Robot is still moving toward the stretched position. Capture
+            # buffer is cleared by the main loop while this is the case.
+            if rp == "moving_to_start":
+                state.footer_hint = "Robot is moving to start — stay relaxed"
+            elif rp == "at_start":
+                state.footer_hint = "Robot is ready — about to begin the stretch"
+            elif rp == "executing":
+                state.footer_hint = "Robot is stretching — follow the motion"
+            elif rp == "aborted":
+                state.footer_hint = "Robot aborted — see status panel"
+            else:
+                state.footer_hint = "Waiting for robot to reach the end position…"
+        else:
+            _capture_footer_and_overlays(
+                step_label="Hold at limit",
+                locked_label="Assisted",
+                next_label="see results",
+            )
+
+    elif workflow.step == 5:
+        baseline = workflow.baseline_angle
+        assisted = workflow.assisted_angle
+        delta = (assisted - baseline) if (baseline is not None and assisted is not None) else None
+        state.hero_kicker = "Step 5 · Results"
+        if delta is None:
+            state.hero_title = "Results"
+        elif delta > 0:
+            state.hero_title = f"+{delta:.0f}° improvement with assistance"
+        else:
+            state.hero_title = f"{delta:.0f}° change with assistance"
+        state.hero_subtitle = ""
+        state.hero_bullets = None
+        state.comparison = [
+            ComparisonRow("Left arm 2D flexion",
+                          before=baseline, after=assisted),
+        ]
+        state.comparison_caption = (
+            "Before = your own peak raise. After = peak raise with robot assist."
+        )
+        state.footer_hint = "Press Space to restart   ·   q to quit"
+
+    return state
+
+
 def main() -> None:
     args = parse_args()
     ensure_model(args.model)
@@ -1979,6 +2256,13 @@ def main() -> None:
 
     cap.set(cv2.CAP_PROP_FRAME_WIDTH, args.width)
     cap.set(cv2.CAP_PROP_FRAME_HEIGHT, args.height)
+
+    # Detect the display so we can render the UI canvas at native screen
+    # resolution; the fullscreen window then displays 1:1 without scaling.
+    screen_w, screen_h = _detect_screen_size()
+    render_w, render_h = screen_w, screen_h
+    print(f">>> rendering UI at {render_w}x{render_h}")
+
     cv2.namedWindow("Shrimpy Pose MVP", cv2.WINDOW_NORMAL)
     cv2.setWindowProperty("Shrimpy Pose MVP", cv2.WND_PROP_FULLSCREEN, cv2.WINDOW_FULLSCREEN)
     last_timestamp_ms = 0
@@ -2000,6 +2284,7 @@ def main() -> None:
     diagnostic_history = deque(maxlen=max(int(args.test_window_seconds * 90), 180))
     smoothed_measurement_frame = None
     missing_measurement_frames = 0
+    workflow = WorkflowState()
 
     with PoseLandmarker.create_from_options(options) as landmarker:
         while True:
@@ -2091,7 +2376,47 @@ def main() -> None:
             fps = instantaneous_fps if fps == 0.0 else (fps * 0.9) + (instantaneous_fps * 0.1)
             previous_frame_time = now
 
-            render_frame(
+            robot_snapshot = robot_client.snapshot() if robot_client else None
+
+            # Drive the patient workflow off the left-arm 2D flexion angle
+            # (camera is mirrored, so the patient's left arm is the one
+            # visually raised on the right side of the screen).
+            # Step 4's capture is gated: the robot must be at_end before we
+            # start measuring the stable peak. Outside step 4, always track.
+            l_2d_flex = (image_plane_angles.get("L", {}) or {}).get("humerus_flexion")
+            if workflow.step == 4:
+                at_end = (
+                    robot_snapshot is not None
+                    and getattr(robot_snapshot, "phase", "") == "at_end"
+                )
+                if at_end:
+                    workflow.update(now, l_2d_flex)
+                else:
+                    # Robot hasn't reached the stretched position yet; don't
+                    # accumulate samples or capture a peak.
+                    workflow.angle_buffer.clear()
+                    workflow.last_stable_angle = None
+            else:
+                workflow.update(now, l_2d_flex)
+            dev_overlay = (
+                f"dev   ·   view={args.view}   ·   step={workflow.step}/5   ·   "
+                f"poses={pose_count}   ·   fps={fps:4.1f}   ·   "
+                f"ts={result_timestamp_ms}ms"
+            )
+
+            # Workflow drives the UI unless a diagnostic mode is active.
+            if calibration.active or test_capture.active or rom_sweep.active:
+                ui_state = None
+            else:
+                ui_state = workflow_state_to_ui(
+                    workflow,
+                    image_plane_angles=image_plane_angles,
+                    robot_state=robot_snapshot,
+                    now=now,
+                    dev_overlay=dev_overlay,
+                )
+
+            canvas = render_frame(
                 frame,
                 result=result,
                 visibility_threshold=args.min_confidence,
@@ -2105,10 +2430,12 @@ def main() -> None:
                 fps=fps,
                 result_timestamp_ms=result_timestamp_ms,
                 now=now,
-                robot_state=robot_client.snapshot() if robot_client else None,
+                robot_state=robot_snapshot,
+                ui_state=ui_state,
+                render_size=(render_w, render_h),
             )
 
-            cv2.imshow("Shrimpy Pose MVP", frame)
+            cv2.imshow("Shrimpy Pose MVP", canvas)
             raw_key = cv2.waitKeyEx(1)
             key = raw_key & 0xFF
             if raw_key in LEFT_ARROW_KEYS and rom_sweep.active and not rom_sweep.recording:
@@ -2149,6 +2476,22 @@ def main() -> None:
                         save_rom_sweep(rom_sweep, args.capture_dir)
                     else:
                         rom_sweep.begin_recording(now)
+                else:
+                    prev_step = workflow.step
+                    if workflow.advance(now) and robot_client is not None:
+                        transition = (prev_step, workflow.step)
+                        # Each workflow transition that requires a robot motion
+                        # sends the corresponding command. piper_sequence_demo
+                        # is parked at wait_for_command(expected) for each.
+                        command = {
+                            (2, 3): "start_session",
+                            (3, 4): "begin_workout",
+                            (4, 5): "end_session",
+                        }.get(transition)
+                        if command is not None:
+                            sent = robot_client.send_command(command)
+                            print(f"[workflow] {prev_step}->{workflow.step}: "
+                                  f"sent '{command}' (delivered={sent})")
             elif key in (27, ord("q")):
                 break
 

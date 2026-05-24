@@ -993,109 +993,18 @@ def draw_countdown(frame, state: UIState) -> None:
     if angle > 0:
         cv2.ellipse(frame, (ring_cx, ring_cy), (radius, radius), -90, 0, angle,
                     C.ACCENT, 4, cv2.LINE_AA)
-    step = rom.step()
-    if rom.recording and step is not None:
-        elapsed = max(now - rom.started_at, 0.0)
-        image_plane = (rom.last_image_plane_angles or {}).get(step.arm, {})
-        image_plane_text = (
-            f"2D frame flex: hum {format_angle(image_plane.get('humerus_flexion'))} deg"
-            f" | reach {format_angle(image_plane.get('reach_flexion'))} deg"
-        )
-        title = f"ROM sweep recording: {step.arm} arm"
-        instruction = step.instruction
-        expected = "Move slowly into max flexion. Hold briefly if useful; Space stops and saves."
-        status = f"Recording {elapsed:4.1f}s | Press Space to stop"
-        color = (190, 120, 255)
-    elif step is not None:
-        title = f"ROM sweep {rom.current_step + 1}/{len(rom.steps)}: {step.arm} arm"
-        instruction = step.instruction
-        expected = "Left/Right arrows select arm. Space starts; Space again saves."
-        status = rom.status
-        color = (190, 120, 255)
-    else:
-        title = "ROM sweep complete"
-        instruction = "Press r to repeat flexion ROM sweeps for the current view."
-        expected = (
-            f"Last saved: {rom.last_saved_json_path}"
-            if rom.last_saved_json_path
-            else "No ROM sweep saved yet."
-        )
-        status = rom.status
-        color = (40, 255, 120)
-
-    lines = (
-        (title, 0.66, color, 2),
-        (instruction, 0.54, (245, 240, 255), 1),
-        (expected, 0.48, (220, 205, 255), 1),
-        (image_plane_text if rom.recording and step is not None else "", 0.52, (110, 235, 255), 2),
-        (status, 0.54, (255, 230, 160), 2),
-    )
-    draw_lines(frame, lines, x, y, line_height=28, truncate=105)
 
 
-PHASE_LABELS = {
-    "disconnected": ("ROBOT OFFLINE", (120, 120, 140)),
-    "at_home": ("AT HOME", (180, 180, 180)),
-    "moving_to_start": ("MOVING TO START", (80, 220, 255)),
-    "at_start": ("AT START - awaiting auth", (120, 220, 255)),
-    "executing": ("EXECUTING", (40, 255, 120)),
-    "at_end": ("AT END - awaiting auth", (255, 200, 80)),
-    "returning_home": ("RETURNING HOME", (80, 220, 255)),
-    "aborted": ("ABORTED", (60, 80, 255)),
+ROBOT_PHASE_LABELS = {
+    "disconnected": "Robot offline",
+    "at_home": "At home",
+    "moving_to_start": "Moving to start",
+    "at_start": "At start — awaiting auth",
+    "executing": "Executing",
+    "at_end": "At end — awaiting auth",
+    "returning_home": "Returning home",
+    "aborted": "Aborted",
 }
-
-
-def draw_robot_panel(frame, robot_state, now: float) -> None:
-    if robot_state is None:
-        return
-
-    _height, width = frame.shape[:2]
-    panel_width, panel_height = 460, 138
-    x = max(width - panel_width - 24, 24)
-    y = 24 + 138 + 16
-
-    overlay = frame.copy()
-    cv2.rectangle(
-        overlay,
-        (x - 10, y - 12),
-        (x + panel_width, y + panel_height),
-        (14, 28, 22),
-        -1,
-    )
-    cv2.addWeighted(overlay, 0.64, frame, 0.36, 0, frame)
-
-    dot_color = (40, 255, 120) if robot_state.connected else (60, 80, 255)
-    cv2.circle(frame, (x + 8, y + 4), 7, dot_color, -1, cv2.LINE_AA)
-
-    capture = robot_state.capture_name or "(no capture selected)"
-    header = f"  ROBOT: {capture}"
-
-    phase_label, phase_color = PHASE_LABELS.get(
-        robot_state.phase, (robot_state.phase.upper(), (220, 220, 220))
-    )
-
-    if robot_state.target:
-        detail_line = f"target: {robot_state.target}"
-    elif robot_state.step:
-        detail_line = f"step: {robot_state.step}"
-    elif robot_state.detail:
-        detail_line = robot_state.detail
-    else:
-        detail_line = ""
-
-    if robot_state.last_event_at > 0:
-        age = max(now - robot_state.last_event_at, 0.0)
-        age_line = f"last event: {age:5.1f}s ago"
-    else:
-        age_line = "last event: --"
-
-    lines = (
-        (header, 0.62, (220, 245, 230), 2),
-        (phase_label, 0.78, phase_color, 2),
-        (detail_line, 0.52, (220, 230, 220), 1),
-        (age_line, 0.46, (170, 190, 175), 1),
-    )
-    draw_lines(frame, lines, x, y, line_height=28, truncate=58)
 
 
 def draw_big_callout(frame, state: UIState) -> None:
@@ -1150,12 +1059,36 @@ def render_ui(frame, state: UIState) -> None:
 # Backwards-compatible render_frame
 # ---------------------------------------------------------------------------
 
+def compose_camera_into_canvas(canvas, camera_frame) -> tuple[int, int, int, int]:
+    """Composite the camera frame into the camera region of the canvas using a
+    cover fit (scale to fill, crop overflow). Mutates canvas in place. Returns
+    the camera region bounds (x, y, w, h)."""
+    h, w = canvas.shape[:2]
+    cam_x, cam_y, cam_w, cam_h = _camera_bounds(w, h)
+    if camera_frame is None or cam_w <= 0 or cam_h <= 0:
+        return cam_x, cam_y, cam_w, cam_h
+    src_h, src_w = camera_frame.shape[:2]
+    if src_w <= 0 or src_h <= 0:
+        return cam_x, cam_y, cam_w, cam_h
+    scale = max(cam_w / src_w, cam_h / src_h)
+    new_w = max(2, int(round(src_w * scale)))
+    new_h = max(2, int(round(src_h * scale)))
+    resized = cv2.resize(camera_frame, (new_w, new_h), interpolation=cv2.INTER_AREA)
+    crop_x = max(0, (new_w - cam_w) // 2)
+    crop_y = max(0, (new_h - cam_h) // 2)
+    cropped = resized[crop_y:crop_y + cam_h, crop_x:crop_x + cam_w]
+    ch_actual, cw_actual = cropped.shape[:2]
+    canvas[cam_y:cam_y + ch_actual, cam_x:cam_x + cw_actual] = cropped
+    return cam_x, cam_y, cam_w, cam_h
+
+
 def render_frame(
     frame,
     *,
     result=None,
     visibility_threshold: float = 0.5,
     angles: Optional[dict] = None,
+    image_plane_angles: Optional[dict] = None,
     calibration=None,
     test_capture=None,
     rom=None,
@@ -1164,19 +1097,40 @@ def render_frame(
     fps: float = 0.0,
     result_timestamp_ms: int = 0,
     now: float = 0.0,
+    robot_state=None,
     ui_state: Optional[UIState] = None,
-) -> None:
-    draw_pose(frame, result, visibility_threshold)
-    draw_status(frame, view_mode, pose_count, fps, result_timestamp_ms)
-    draw_angle_panel(frame, angles, image_plane_angles, now)
-    draw_calibration_panel(frame, calibration, view_mode)
-    draw_test_capture_panel(frame, test_capture)
-    draw_rom_panel(frame, rom, now)
-    draw_robot_panel(frame, robot_state, now)
-    
+    render_size: Optional[tuple[int, int]] = None,
+) -> np.ndarray:
+    """Build the full Stretch Goals UI canvas for one frame and return it.
+
+    The caller should `cv2.imshow(window, render_frame(...))`. Pose skeleton is
+    drawn on the raw camera frame before it's composited into the canvas, so
+    landmarks track the camera image exactly.
+    """
+    if render_size is None:
+        cam_h, cam_w = frame.shape[:2] if frame is not None else (720, 1280)
+        render_h = max(720, cam_h)
+        if cam_w > 0 and cam_h > 0:
+            render_w = int(round(render_h * (cam_w / cam_h)))
+        else:
+            render_w = render_h * 16 // 9
+    else:
+        render_w, render_h = render_size
+    if render_w % 2:
+        render_w += 1
+    if render_h % 2:
+        render_h += 1
+
+    canvas = _make_backdrop(render_w, render_h)
+
+    if frame is not None and result is not None:
+        draw_pose(frame, result, visibility_threshold)
+    compose_camera_into_canvas(canvas, frame)
+
     if ui_state is None:
         ui_state = _legacy_state_to_ui(
             angles=angles or {},
+            image_plane_angles=image_plane_angles or {},
             calibration=calibration,
             test_capture=test_capture,
             rom=rom,
@@ -1185,14 +1139,24 @@ def render_frame(
             fps=fps,
             result_timestamp_ms=result_timestamp_ms,
             now=now,
+            robot_state=robot_state,
         )
 
-    render_ui(frame, ui_state)
+    render_ui(canvas, ui_state)
+    return canvas
+
+
+def _default_checklist() -> list:
+    return [
+        ChecklistItem("Get into ready position", "active"),
+        ChecklistItem("3-point arm assessment", "pending"),
+        ChecklistItem("Robot led stretch", "pending"),
+    ]
 
 
 def _legacy_state_to_ui(
-    *, angles, calibration, test_capture, rom, view_mode,
-    pose_count, fps, result_timestamp_ms, now,
+    *, angles, image_plane_angles, calibration, test_capture, rom, view_mode,
+    pose_count, fps, result_timestamp_ms, now, robot_state=None,
 ) -> UIState:
     state = UIState()
     state.dev_overlay = (
@@ -1200,10 +1164,11 @@ def _legacy_state_to_ui(
         f"fps={fps:4.1f}   ·   ts={result_timestamp_ms}ms"
     )
 
+    # ---- Defaults: idle / waiting --------------------------------------
     state.phase = 0
-    state.step_total = 5
+    state.step_total = 3
     state.step_index = 0
-    state.hero_kicker = "Welcome to Stretch Goals"
+    state.hero_kicker = "Let's get ready for your Range of Motion assessment"
     state.hero_title = "Sit down and face the camera"
     state.hero_bullets = [
         "Sit upright with both feet flat on the floor",
@@ -1211,50 +1176,114 @@ def _legacy_state_to_ui(
         "Relax your arms loosely at your sides",
         "Face the camera so your full upper body is visible",
     ]
-    state.checklist = [
-        ChecklistItem("Sit in ready position", "active"),
-        ChecklistItem("Flexion: arm forward and up", "pending"),
-        ChecklistItem("Abduction: arm out to side", "pending"),
-        ChecklistItem("Outward rotation", "pending"),
-        ChecklistItem("Robot stretch + report", "pending"),
-    ]
+    state.checklist = _default_checklist()
+    state.footer_hint = (
+        "Press  c  calibrate   ·   t  test capture   ·   "
+        "r  ROM sweep   ·   q  quit"
+    )
 
     arm_angles_l = angles.get("L", {}) if angles else {}
     arm_angles_r = angles.get("R", {}) if angles else {}
     state.angles = [
-        AngleReading("Flexion", "R", arm_angles_r.get("flexion"), target_min=150),
-        AngleReading("Flexion", "L", arm_angles_l.get("flexion"), target_min=150),
+        AngleReading("Flexion", "R", arm_angles_r.get("flexion"),
+                     target_min=150, status="live"),
+        AngleReading("Flexion", "L", arm_angles_l.get("flexion"),
+                     target_min=150, status="live"),
     ]
 
+    # ---- Workflow: calibration -----------------------------------------
     if calibration is not None and getattr(calibration, "active", False):
         step = calibration.step() if hasattr(calibration, "step") else None
-        state.hero_kicker = "Setup   ·   Calibration"
-        state.hero_title = "Hold the calibration pose"
-        state.hero_subtitle = step.instruction if step else "Stay still..."
+        status_text = getattr(calibration, "status", "") or ""
+        state.phase = 0
+        state.hero_kicker = "Setup · Calibration"
+        state.hero_title = (step.name.replace("_", " ").title()
+                            if step else "Hold the calibration pose")
+        state.hero_subtitle = step.instruction if step else "Stay still…"
         state.hero_bullets = None
-        state.checklist[0] = ChecklistItem("Calibrating cameras", "active")
+        state.checklist = _default_checklist()
+        state.checklist[0] = ChecklistItem("Calibrating cameras", "active",
+                                           status_text)
+        state.footer_hint = "Space captures now   ·   q quits"
 
+    # ---- Workflow: ROM sweep -------------------------------------------
     if rom is not None and getattr(rom, "active", False):
         step = rom.step() if hasattr(rom, "step") else None
         state.phase = 1
         state.step_index = 1
-        state.hero_kicker = "Phase 1   ·   ROM sweep"
-        state.hero_title = "Sweep your arm overhead"
-        state.hero_subtitle = step.instruction if step else "Move slowly through your full range."
+        state.hero_kicker = "Phase 1 · ROM sweep"
+        arm_label = f"{step.arm} arm" if step and hasattr(step, "arm") else "arm"
+        state.hero_title = (f"Sweep your {arm_label} overhead"
+                            if step else "ROM sweep")
+        state.hero_subtitle = (step.instruction if step
+                               else "Move slowly through your full range.")
         state.hero_bullets = None
+        state.checklist = _default_checklist()
+        state.checklist[0] = ChecklistItem("Get into ready position", "done")
+        state.checklist[1] = ChecklistItem("3-point arm assessment", "active",
+                                           "ROM sweep in progress")
         if getattr(rom, "recording", False):
-            remaining = max(rom.duration_seconds - (now - rom.started_at), 0.0)
+            duration = getattr(rom, "duration_seconds", 0.0)
+            started_at = getattr(rom, "started_at", now)
+            remaining = max(duration - (now - started_at), 0.0)
             state.countdown_seconds = remaining
             state.countdown_label = "Recording sweep"
+            state.footer_hint = "Sweep through full range   ·   Space stops early"
+        else:
+            state.footer_hint = "Space starts recording   ·   ← → switch arm"
 
+    # ---- Workflow: diagnostic test capture -----------------------------
     if test_capture is not None and getattr(test_capture, "active", False):
         step = test_capture.step() if hasattr(test_capture, "step") else None
-        state.hero_kicker = "Phase 1   ·   Diagnostic capture"
+        state.phase = 1
+        state.step_index = 1
+        state.hero_kicker = "Phase 1 · Diagnostic capture"
         state.hero_title = step.name.title() if step else "Capture pose"
         state.hero_subtitle = step.instruction if step else ""
         state.hero_bullets = None
         state.big_callout = "HOLD"
         state.big_callout_color = C.WARN
+        state.checklist = _default_checklist()
+        state.checklist[0] = ChecklistItem("Get into ready position", "done")
+        state.checklist[1] = ChecklistItem("3-point arm assessment", "active",
+                                           "Diagnostic capture")
+        state.footer_hint = "Hold steady   ·   Space captures now"
+
+    # ---- Robot bridge overlay (phase 2) --------------------------------
+    if robot_state is not None and getattr(robot_state, "connected", False):
+        rp = getattr(robot_state, "phase", "disconnected")
+        if rp in ("moving_to_start", "at_start", "executing",
+                  "at_end", "returning_home"):
+            state.phase = 2
+            state.step_index = 2
+            state.hero_kicker = "Phase 2 · Robot-led stretch"
+            phase_titles = {
+                "moving_to_start": "Robot is moving to start position",
+                "at_start": "Hold the start position",
+                "executing": "Robot is guiding your stretch",
+                "at_end": "Final position reached",
+                "returning_home": "Robot returning home",
+            }
+            state.hero_title = phase_titles.get(rp, ROBOT_PHASE_LABELS.get(rp, rp))
+            state.hero_subtitle = None
+            state.hero_bullets = None
+            state.checklist = _default_checklist()
+            state.checklist[0] = ChecklistItem("Get into ready position", "done")
+            state.checklist[1] = ChecklistItem("3-point arm assessment", "done")
+            state.checklist[2] = ChecklistItem("Robot led stretch", "active",
+                                               ROBOT_PHASE_LABELS.get(rp, rp))
+            detail = robot_state.step or robot_state.target or ""
+            cap_name = robot_state.capture_name or "(no capture)"
+            state.robot_state = (f"{cap_name}  ·  {ROBOT_PHASE_LABELS.get(rp, rp)}"
+                                 + (f"  ·  {detail}" if detail else ""))
+            state.footer_hint = "Robot is in control   ·   q quits"
+        elif rp == "aborted":
+            state.robot_state = "ROBOT ABORTED"
+            state.robot_safety = robot_state.detail or "Safety stop triggered"
+            state.footer_hint = "Restart the robot to retry"
+        elif rp == "at_home":
+            state.robot_state = (f"{robot_state.capture_name or '(no capture)'}"
+                                 f"  ·  at home, ready to start")
 
     return state
 
