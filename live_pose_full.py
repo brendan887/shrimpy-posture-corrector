@@ -1949,7 +1949,7 @@ class WorkflowState:
     right-arm sequence — only the camera-side measurement was swapped.
     """
     HOLD_SECONDS: ClassVar[float] = 3.0
-    STABILITY_TOL_DEG: ClassVar[float] = 4.0
+    STABILITY_TOL_DEG: ClassVar[float] = 8.0
 
     step: int = 1
     angle_buffer: deque = field(default_factory=lambda: deque(maxlen=300))
@@ -1979,19 +1979,26 @@ class WorkflowState:
         if not self.angle_buffer:
             self.last_stable_angle = None
             return
+
+        values = [a for _, a in self.angle_buffer]
+        if max(values) - min(values) > self.STABILITY_TOL_DEG:
+            # Stability broken: reset the buffer to just this sample so the
+            # countdown restarts from zero the instant the user becomes stable
+            # again (rather than waiting for old unstable samples to age out).
+            self.angle_buffer.clear()
+            self.angle_buffer.append((now, angle))
+            self.last_stable_angle = None
+            return
+
         oldest_ts = self.angle_buffer[0][0]
         if now - oldest_ts < self.HOLD_SECONDS - 0.05:
             self.last_stable_angle = None
             return
 
-        values = [a for _, a in self.angle_buffer]
-        if max(values) - min(values) <= self.STABILITY_TOL_DEG:
-            stable_value = sum(values) / len(values)
-            self.last_stable_angle = stable_value
-            if self.peak_during_step is None or stable_value > self.peak_during_step:
-                self.peak_during_step = stable_value
-        else:
-            self.last_stable_angle = None
+        stable_value = sum(values) / len(values)
+        self.last_stable_angle = stable_value
+        if self.peak_during_step is None or stable_value > self.peak_during_step:
+            self.peak_during_step = stable_value
 
     def hold_progress(self, now: float) -> float:
         """0..1 fraction of HOLD_SECONDS spent under the stability tolerance."""
@@ -2126,15 +2133,33 @@ def workflow_state_to_ui(
         state.hero_title = "Raise your left arm to your natural limit"
         state.hero_bullets = [
             "Raise your left arm in a relaxed motion",
-            "Hold at your natural limit for 3 seconds",
+            "Once past horizontal, hold at your natural limit for 3 seconds",
             "We capture your highest stable angle automatically",
             "Press Space to lock in your baseline and continue",
         ]
-        _capture_footer_and_overlays(
-            step_label="Hold steady",
-            locked_label="Baseline",
-            next_label="continue",
-        )
+        state.show_arm_raise_animation = True
+        # Below 90° we suppress the timer entirely (the buffer is also cleared
+        # in the main loop), so the only way to start the 3s countdown is to
+        # raise the arm past horizontal.
+        if l_2d is None or l_2d <= 90.0:
+            if workflow.peak_during_step is not None:
+                # Captured already; show locked peak even if the user dropped.
+                state.footer_hint = (
+                    f"Baseline: {workflow.peak_during_step:.0f}°   ·   "
+                    f"Space to continue"
+                )
+                state.big_callout = f"PEAK: {workflow.peak_during_step:.0f}°"
+                state.big_callout_color = C.SUCCESS
+            else:
+                state.footer_hint = (
+                    "Raise your arm above shoulder height to start the timer"
+                )
+        else:
+            _capture_footer_and_overlays(
+                step_label="Hold steady",
+                locked_label="Baseline",
+                next_label="continue",
+            )
 
     elif workflow.step == 3:
         state.hero_kicker = "Step 3 · Grab the handle"
@@ -2205,6 +2230,8 @@ def workflow_state_to_ui(
             "Before = your own peak raise. After = peak raise with robot assist."
         )
         state.footer_hint = "Press Space to restart   ·   q to quit"
+        # Take over the whole canvas with a presenter-friendly results layout.
+        state.show_fullscreen_results = True
 
     return state
 
@@ -2381,10 +2408,21 @@ def main() -> None:
             # Drive the patient workflow off the left-arm 2D flexion angle
             # (camera is mirrored, so the patient's left arm is the one
             # visually raised on the right side of the screen).
-            # Step 4's capture is gated: the robot must be at_end before we
-            # start measuring the stable peak. Outside step 4, always track.
+            # Step 2's capture only starts once the arm crosses horizontal
+            # (>90°). Step 4's capture is gated on the robot being at_end.
+            # Outside those, always track.
             l_2d_flex = (image_plane_angles.get("L", {}) or {}).get("humerus_flexion")
-            if workflow.step == 4:
+            if workflow.step == 2:
+                above_horizontal = (
+                    l_2d_flex is not None and l_2d_flex > 90.0
+                )
+                if above_horizontal:
+                    workflow.update(now, l_2d_flex)
+                else:
+                    # Arm not raised past horizontal yet; suppress the timer.
+                    workflow.angle_buffer.clear()
+                    workflow.last_stable_angle = None
+            elif workflow.step == 4:
                 at_end = (
                     robot_snapshot is not None
                     and getattr(robot_snapshot, "phase", "") == "at_end"

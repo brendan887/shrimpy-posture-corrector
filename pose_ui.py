@@ -24,6 +24,7 @@ Backwards-compatible exports for live_pose_full.py:
 
 from __future__ import annotations
 
+import math
 import os
 import platform
 import sys
@@ -242,6 +243,170 @@ def _alpha_rect(frame, top_left, bottom_right, color, alpha: float) -> None:
     overlay = frame.copy()
     cv2.rectangle(overlay, top_left, bottom_right, color, -1)
     cv2.addWeighted(overlay, alpha, frame, 1.0 - alpha, 0, frame)
+
+
+def _rounded_filled(img, top_left, bottom_right, color, radius: int = 12) -> None:
+    """Filled rounded rectangle drawn directly on img."""
+    x1, y1 = top_left
+    x2, y2 = bottom_right
+    radius = max(0, min(radius, (x2 - x1) // 2, (y2 - y1) // 2))
+    if radius == 0:
+        cv2.rectangle(img, top_left, bottom_right, color, -1, cv2.LINE_AA)
+        return
+    cv2.rectangle(img, (x1 + radius, y1), (x2 - radius, y2), color, -1, cv2.LINE_AA)
+    cv2.rectangle(img, (x1, y1 + radius), (x2, y2 - radius), color, -1, cv2.LINE_AA)
+    cv2.ellipse(img, (x1 + radius, y1 + radius), (radius, radius), 180, 0, 90, color, -1, cv2.LINE_AA)
+    cv2.ellipse(img, (x2 - radius, y1 + radius), (radius, radius), 270, 0, 90, color, -1, cv2.LINE_AA)
+    cv2.ellipse(img, (x1 + radius, y2 - radius), (radius, radius),  90, 0, 90, color, -1, cv2.LINE_AA)
+    cv2.ellipse(img, (x2 - radius, y2 - radius), (radius, radius),   0, 0, 90, color, -1, cv2.LINE_AA)
+
+
+def _rounded_stroke(img, top_left, bottom_right, color, thickness: int = 2, radius: int = 12) -> None:
+    """Rounded rectangle outline."""
+    x1, y1 = top_left
+    x2, y2 = bottom_right
+    radius = max(0, min(radius, (x2 - x1) // 2, (y2 - y1) // 2))
+    if radius == 0:
+        cv2.rectangle(img, top_left, bottom_right, color, thickness, cv2.LINE_AA)
+        return
+    cv2.line(img, (x1 + radius, y1), (x2 - radius, y1), color, thickness, cv2.LINE_AA)
+    cv2.line(img, (x1 + radius, y2), (x2 - radius, y2), color, thickness, cv2.LINE_AA)
+    cv2.line(img, (x1, y1 + radius), (x1, y2 - radius), color, thickness, cv2.LINE_AA)
+    cv2.line(img, (x2, y1 + radius), (x2, y2 - radius), color, thickness, cv2.LINE_AA)
+    cv2.ellipse(img, (x1 + radius, y1 + radius), (radius, radius), 180, 0, 90, color, thickness, cv2.LINE_AA)
+    cv2.ellipse(img, (x2 - radius, y1 + radius), (radius, radius), 270, 0, 90, color, thickness, cv2.LINE_AA)
+    cv2.ellipse(img, (x1 + radius, y2 - radius), (radius, radius),  90, 0, 90, color, thickness, cv2.LINE_AA)
+    cv2.ellipse(img, (x2 - radius, y2 - radius), (radius, radius),   0, 0, 90, color, thickness, cv2.LINE_AA)
+
+
+def _rounded_alpha_rect(frame, top_left, bottom_right, color, alpha: float,
+                        radius: int = 12) -> None:
+    overlay = frame.copy()
+    _rounded_filled(overlay, top_left, bottom_right, color, radius)
+    cv2.addWeighted(overlay, alpha, frame, 1.0 - alpha, 0, frame)
+
+
+# ---------------------------------------------------------------------------
+# RGBA image compositing (for sprite-sheet animations)
+# ---------------------------------------------------------------------------
+
+def composite_rgba(canvas, rgba, x: int, y: int, opacity: float = 1.0) -> None:
+    """Alpha-blend an RGBA image onto canvas at (x, y). Per-pixel alpha is
+    multiplied by `opacity` (1.0 = full). Out-of-bounds regions are clipped."""
+    if rgba is None or opacity <= 0.0:
+        return
+    ih, iw = rgba.shape[:2]
+    ch, cw = canvas.shape[:2]
+    x1 = max(0, x)
+    y1 = max(0, y)
+    x2 = min(cw, x + iw)
+    y2 = min(ch, y + ih)
+    if x2 <= x1 or y2 <= y1:
+        return
+    sx1, sy1 = x1 - x, y1 - y
+    sx2, sy2 = sx1 + (x2 - x1), sy1 + (y2 - y1)
+
+    src = rgba[sy1:sy2, sx1:sx2]
+    dst = canvas[y1:y2, x1:x2]
+    alpha = (src[:, :, 3:4].astype(np.float32) / 255.0) * float(opacity)
+    blended = src[:, :, :3].astype(np.float32) * alpha + dst.astype(np.float32) * (1.0 - alpha)
+    canvas[y1:y2, x1:x2] = blended.astype(np.uint8)
+
+
+def _key_white_to_alpha(bgr, threshold: int = 230) -> np.ndarray:
+    """Convert an RGB/BGR image to BGRA, treating near-white pixels as
+    transparent. Threshold is the per-channel minimum to count as background."""
+    if bgr.shape[2] == 4:
+        return bgr
+    b, g, r = cv2.split(bgr)
+    a = np.full_like(b, 255)
+    white_mask = (r >= threshold) & (g >= threshold) & (b >= threshold)
+    a[white_mask] = 0
+    # Soften the edge: 1px erosion of the silhouette mask reduces white halo.
+    fg_mask = (~white_mask).astype(np.uint8) * 255
+    fg_mask = cv2.erode(fg_mask, np.ones((2, 2), np.uint8), iterations=1)
+    a = np.where(fg_mask > 0, a, 0).astype(np.uint8)
+    return cv2.merge([b, g, r, a])
+
+
+_ARM_RAISE_FRAMES: Optional[list] = None
+_ARM_RAISE_TARGET_H = 320
+
+
+def _load_arm_raise_frames():
+    """Load step1/2/3.png from images/, key the white background, and pad each
+    frame onto a uniform-size RGBA canvas so they can be cross-faded by
+    pixel-wise blending. Cached after the first call."""
+    global _ARM_RAISE_FRAMES
+    if _ARM_RAISE_FRAMES is not None:
+        return _ARM_RAISE_FRAMES
+
+    here = os.path.dirname(os.path.abspath(__file__))
+    paths = [os.path.join(here, "images", f"step{i}.png") for i in (1, 2, 3)]
+    if not all(os.path.exists(p) for p in paths):
+        _ARM_RAISE_FRAMES = []
+        return _ARM_RAISE_FRAMES
+
+    frames = []
+    for p in paths:
+        img = cv2.imread(p, cv2.IMREAD_UNCHANGED)
+        if img is None:
+            _ARM_RAISE_FRAMES = []
+            return _ARM_RAISE_FRAMES
+        rgba = _key_white_to_alpha(img)
+        ih, iw = rgba.shape[:2]
+        scale = _ARM_RAISE_TARGET_H / float(ih)
+        new_w = max(2, int(round(iw * scale)))
+        rgba = cv2.resize(rgba, (new_w, _ARM_RAISE_TARGET_H),
+                          interpolation=cv2.INTER_AREA)
+        frames.append(rgba)
+
+    # Pad each frame onto a canvas sized to the widest frame (bottom-aligned,
+    # horizontally centered) so all three share the same coordinate system.
+    max_w = max(f.shape[1] for f in frames)
+    uniformed = []
+    for f in frames:
+        canvas = np.zeros((_ARM_RAISE_TARGET_H, max_w, 4), dtype=np.uint8)
+        fh, fw = f.shape[:2]
+        x_off = (max_w - fw) // 2
+        canvas[:, x_off:x_off + fw] = f
+        uniformed.append(canvas)
+
+    _ARM_RAISE_FRAMES = uniformed
+    return _ARM_RAISE_FRAMES
+
+
+def draw_arm_raise_animation(frame, state: UIState, now: float) -> None:
+    """Top-right corner of the camera area, when state.show_arm_raise_animation.
+    Smooth palindrome cycle (0 -> 1 -> 2 -> 1 -> 0) driven by a cosine so the
+    motion eases in/out at each key pose."""
+    if not getattr(state, "show_arm_raise_animation", False):
+        return
+    frames = _load_arm_raise_frames()
+    if not frames:
+        return
+
+    h, w = frame.shape[:2]
+    cx, cy, cw, _ch = _camera_bounds(w, h)
+
+    # Sinusoid 0..2..0, slowing at the extremes (acts as a natural hold).
+    cycle = 3.0
+    pos = 1.0 - math.cos(2.0 * math.pi * (now % cycle) / cycle)  # [0, 2]
+    if pos >= 1.0:
+        low_idx, high_idx, alpha_t = 1, 2, pos - 1.0
+    else:
+        low_idx, high_idx, alpha_t = 0, 1, pos
+    alpha_t = max(0.0, min(1.0, alpha_t))
+
+    fh, fw = frames[0].shape[:2]
+    x = cx + cw - fw - 24
+    y = cy + 40
+
+    # Two-pass composite: lower-weight frame first, then higher-weight on top.
+    # The two key poses overlap (same chair + torso) so silhouette ghosting is
+    # minimal and the moving arm naturally crossfades.
+    composite_rgba(frame, frames[low_idx],  x, y, opacity=(1.0 - alpha_t))
+    composite_rgba(frame, frames[high_idx], x, y, opacity=alpha_t)
 
 
 def draw_panel(
@@ -606,6 +771,12 @@ class UIState:
     countdown_label: str = ""
     big_callout: Optional[str] = None
     big_callout_color: tuple = C.ACCENT
+    # When True, render the 3-frame arm-raise demo loop in the top-right
+    # corner of the camera area (workflow step 2 uses this).
+    show_arm_raise_animation: bool = False
+    # When True, replace the camera + right-panel layout with a fullscreen
+    # presenter view built from state.comparison (workflow step 5 uses this).
+    show_fullscreen_results: bool = False
 
     # Phase-2 robot status (renders inside the right panel)
     robot_state: Optional[str] = None
@@ -1008,27 +1179,31 @@ ROBOT_PHASE_LABELS = {
 
 
 def draw_big_callout(frame, state: UIState) -> None:
-    """Big text callout centered on the camera area (e.g. STRAIGHTEN ARM)."""
+    """Rounded badge anchored top-left of the camera area (e.g. PEAK: 185°)."""
     if not state.big_callout:
         return
-    h, w = frame.shape[:2]
-    cx, cy, cw, ch = _camera_bounds(w, h)
+    _h, w = frame.shape[:2]
+    cx, cy, _cw, _ch = _camera_bounds(w, frame.shape[0])
 
     text = state.big_callout
-    tw, th = _measure_text(text, 70, 2)
-    pad = 30
-    box_w = tw + pad * 2
-    box_h = th + pad
-    # Keep callout above an angle overlay (if any)
-    box_x = cx + (cw - box_w) // 2
-    box_y = cy + (ch - box_h) // 2 - 80
+    size = 48
+    tw, th = _measure_text(text, size, 2)
+    pad_x, pad_y = 24, 16
+    box_w = tw + pad_x * 2
+    box_h = th + pad_y * 2
 
-    _alpha_rect(frame, (box_x, box_y), (box_x + box_w, box_y + box_h),
-                C.SURFACE_PANEL, 0.97)
-    cv2.rectangle(frame, (box_x, box_y), (box_x + box_w, box_y + box_h),
-                  state.big_callout_color, 3, cv2.LINE_AA)
-    draw_text(frame, text, cx + cw // 2, box_y + pad // 2,
-              size=70, color=state.big_callout_color, weight=2, align="center")
+    # Top-left of the camera area, nudged down so it clears the dev overlay row.
+    box_x = cx + 24
+    box_y = cy + 40
+
+    _rounded_alpha_rect(frame, (box_x, box_y), (box_x + box_w, box_y + box_h),
+                        C.SURFACE_PANEL, 0.97, radius=14)
+    _rounded_stroke(frame, (box_x, box_y), (box_x + box_w, box_y + box_h),
+                    state.big_callout_color, thickness=3, radius=14)
+    # Vertically center the text inside the box (PIL anchors at top-left).
+    text_y = box_y + (box_h - th) // 2 - 4
+    draw_text(frame, text, box_x + pad_x, text_y, size=size,
+              color=state.big_callout_color, weight=2)
 
 
 def draw_dev_overlay(frame, state: UIState) -> None:
@@ -1044,8 +1219,117 @@ def draw_dev_overlay(frame, state: UIState) -> None:
 # Top-level render
 # ---------------------------------------------------------------------------
 
+def draw_fullscreen_results(frame, state: UIState) -> None:
+    """Full-canvas presenter view: three big cards (BEFORE / AFTER / DELTA)
+    sized for a projector or TV. Reads values from state.comparison[0]."""
+    h, w = frame.shape[:2]
+    scale = h / 1080.0
+    accent = PHASE_ACCENTS.get(state.phase, C.SUCCESS)
+
+    # Solid panel-pink background covering the whole canvas.
+    cv2.rectangle(frame, (0, 0), (w, h), C.SURFACE_PANEL, -1)
+    cv2.rectangle(frame, (0, 0), (w, max(6, int(10 * scale))), accent, -1)
+
+    # ---- Header / subtitle ----
+    title = state.hero_title or "Your Range of Motion Results"
+    draw_text(frame, title, w // 2, int(80 * scale),
+              size=int(72 * scale), color=C.TEXT_PRIMARY, weight=2, align="center")
+
+    kicker = state.hero_kicker or ""
+    if kicker:
+        draw_text(frame, kicker, w // 2, int(40 * scale),
+                  size=int(22 * scale), color=accent, weight=2, align="center")
+
+    subtitle = state.comparison_caption or ""
+    if subtitle:
+        draw_text(frame, subtitle, w // 2, int(180 * scale),
+                  size=int(28 * scale), color=C.TEXT_SECONDARY, align="center")
+
+    # ---- Values ----
+    if state.comparison:
+        row = state.comparison[0]
+        baseline = row.before
+        assisted = row.after
+        delta = (assisted - baseline) if (baseline is not None and assisted is not None) else None
+        movement_label = row.label
+    else:
+        baseline = assisted = delta = None
+        movement_label = ""
+
+    def _fmt(v):
+        return "—" if v is None else f"{v:.0f}°"
+
+    def _fmt_delta(v):
+        if v is None:
+            return "—"
+        return f"{'+' if v >= 0 else ''}{v:.0f}°"
+
+    if delta is None:
+        delta_color = C.TEXT_PRIMARY
+        delta_caption = "—"
+    elif delta > 0:
+        delta_color = C.SUCCESS
+        delta_caption = "improvement"
+    elif delta < 0:
+        delta_color = C.WARN
+        delta_caption = "regression"
+    else:
+        delta_color = C.TEXT_PRIMARY
+        delta_caption = "no change"
+
+    cards = [
+        ("BEFORE", _fmt(baseline),    "your own raise",     C.TEXT_PRIMARY),
+        ("AFTER",  _fmt(assisted),    "with robot assist",  C.TEXT_PRIMARY),
+        ("DELTA",  _fmt_delta(delta), delta_caption,        delta_color),
+    ]
+
+    card_w = int(500 * scale)
+    card_h = int(540 * scale)
+    gap    = int(50 * scale)
+    total_w = card_w * 3 + gap * 2
+    start_x = (w - total_w) // 2
+    cards_y = int(260 * scale)
+    radius = int(28 * scale)
+
+    for i, (label, value_text, caption, value_color) in enumerate(cards):
+        cx = start_x + i * (card_w + gap)
+        cy = cards_y
+        _rounded_filled(frame, (cx, cy), (cx + card_w, cy + card_h),
+                        C.SURFACE_CARD, radius=radius)
+        _rounded_stroke(frame, (cx, cy), (cx + card_w, cy + card_h),
+                        C.SURFACE_HAIR, thickness=2, radius=radius)
+        # Label (top of card)
+        draw_text(frame, label, cx + card_w // 2, cy + int(40 * scale),
+                  size=int(36 * scale), color=C.TEXT_DIM, weight=2, align="center")
+        # Giant value (vertically centered-ish)
+        draw_text(frame, value_text, cx + card_w // 2, cy + int(170 * scale),
+                  size=int(180 * scale), color=value_color, weight=2, align="center")
+        # Caption (near bottom)
+        draw_text(frame, caption, cx + card_w // 2,
+                  cy + card_h - int(70 * scale),
+                  size=int(30 * scale), color=C.TEXT_SECONDARY, align="center")
+
+    # ---- Movement-name footer + key hint ----
+    if movement_label:
+        draw_text(frame, movement_label.upper(),
+                  w // 2, cards_y + card_h + int(40 * scale),
+                  size=int(24 * scale), color=C.TEXT_DIM, weight=2, align="center")
+
+    footer = state.footer_hint or "Press Space to restart   ·   q to quit"
+    draw_text(frame, footer, w // 2, h - int(60 * scale),
+              size=int(28 * scale), color=C.TEXT_DIM, align="center")
+
+
 def render_ui(frame, state: UIState) -> None:
     """Draw the patient-facing UI on top of an existing frame."""
+    if getattr(state, "show_fullscreen_results", False):
+        with _text_batch(frame):
+            draw_fullscreen_results(frame, state)
+        return
+
+    now = time.monotonic()
+    # Sprite composites first so panels and text render cleanly above them.
+    draw_arm_raise_animation(frame, state, now)
     with _text_batch(frame):
         draw_phase_header(frame, state)
         draw_right_panel(frame, state)
