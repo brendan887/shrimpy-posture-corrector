@@ -82,18 +82,26 @@ python live_pose_full.py --test-countdown-seconds 2 --test-stillness 0.06
 
 ## Flexion ROM Sweep
 
-Press `r` to start the flexion range-of-motion diagnostic. The UI records one timed sweep for the left arm, then one timed sweep for the right arm:
+Press `r` to start the flexion range-of-motion diagnostic. For side and 45-degree views, the UI records only the arm closest to the camera. For front view, it records one sweep for each landmark arm because neither arm is camera-side.
 
 - Start with the active arm relaxed down.
 - Press `Space` to begin recording.
-- Sweep the active arm forward/up overhead as far as comfortable.
-- Return the arm back down before the timer ends.
-- Press `Space` during recording to finish early.
+- Sweep the active arm forward/up overhead as far as comfortable, including behind the head if that is the ROM you want to measure.
+- Hold briefly at interesting points if useful.
+- Press `Space` again to stop and save the sweep.
 
-Each sweep saves a JSON trace and key-frame PNGs for start, min flexion, max flexion, nearest 90 degrees, and end. The JSON includes `rom_summary` with min flexion, max flexion, ROM, timing of min/max, abduction cross-talk during the sweep, and valid sample counts.
+Because the app mirrors the webcam image before MediaPipe inference, the camera-side landmark label is opposite the side-view name: `right-side` and `right-45` record the `L` landmark arm, while `left-side` and `left-45` record the `R` landmark arm. This matches the side-view captures we have been diagnosing.
+
+Each sweep saves a JSON trace and key-frame PNGs for start, min flexion, max flexion, nearest 90 degrees, and end. The JSON includes:
+
+- `rom_summary`: legacy displayed-angle min/max flexion and abduction cross-talk.
+- `advanced_rom_summary`: sweep-plane unwrapped ROM for `humerus` and `reach` vectors.
+- `image_plane_rom_summary`: fixed-camera 2D flexion estimate where `0` is down in the frame, `90` points left in the frame, `180` is straight up, and values above `180` mean the arm has moved past vertical.
+
+`humerus` uses shoulder-to-elbow. `reach` uses shoulder-to-hand/wrist and is useful when the user bends the elbow while reaching behind the head. The 2D image-plane estimate is meant for fixed side-ish camera angles and is logged/displayed in addition to the existing torso/world-based measurements.
 
 ```bash
-python live_pose_full.py --rom-sweep-seconds 12
+python live_pose_full.py --view right-side
 ```
 
 Regenerate diagnostic summary charts:

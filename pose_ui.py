@@ -3,7 +3,7 @@ from __future__ import annotations
 import cv2
 
 
-VIEW_MODES = ("front", "left-45", "right-45")
+VIEW_MODES = ("front", "left-45", "right-45", "left-side", "right-side")
 
 VIEW_GUIDANCE = {
     "front": {
@@ -12,11 +12,19 @@ VIEW_GUIDANCE = {
     },
     "left-45": {
         "title": "Left 45-degree mode",
-        "instruction": "Place camera at your left-front 45 deg angle. Good compromise for flexion.",
+        "instruction": "Place camera at your left-front 45 deg angle. ROM sweep uses the camera-side R landmark arm.",
     },
     "right-45": {
         "title": "Right 45-degree mode",
-        "instruction": "Place camera at your right-front 45 deg angle. Good compromise for flexion.",
+        "instruction": "Place camera at your right-front 45 deg angle. ROM sweep uses the camera-side L landmark arm.",
+    },
+    "left-side": {
+        "title": "Left side-view mode",
+        "instruction": "Place camera near your left side. ROM sweep uses the camera-side R landmark arm.",
+    },
+    "right-side": {
+        "title": "Right side-view mode",
+        "instruction": "Place camera near your right side. ROM sweep uses the camera-side L landmark arm.",
     },
 }
 
@@ -85,8 +93,9 @@ def format_angle(value: float | None) -> str:
     return f"{value:5.1f}"
 
 
-def draw_angle_panel(frame, angles) -> None:
-    panel_width, panel_height = 420, 112
+def draw_angle_panel(frame, angles, image_plane_angles=None) -> None:
+    image_plane_angles = image_plane_angles or {}
+    panel_width, panel_height = 560, 172
     x, y = 24, 92 + int(panel_height * 0.25)
     overlay = frame.copy()
     cv2.rectangle(
@@ -121,6 +130,8 @@ def draw_angle_panel(frame, angles) -> None:
 
     for row, arm_name in enumerate(("L", "R")):
         arm_angles = angles.get(arm_name, {})
+        image_angles = image_plane_angles.get(arm_name, {})
+        row_y = y + 62 + (row * 54)
         text = (
             f"{arm_name}  flex {format_angle(arm_angles.get('flexion'))} deg"
             f"   abd {format_angle(arm_angles.get('abduction'))} deg"
@@ -128,10 +139,24 @@ def draw_angle_panel(frame, angles) -> None:
         cv2.putText(
             frame,
             text,
-            (x, y + 62 + (row * 30)),
+            (x, row_y),
             cv2.FONT_HERSHEY_SIMPLEX,
             0.72,
             (80, 220, 255) if arm_name == "L" else (40, 255, 120),
+            2,
+            cv2.LINE_AA,
+        )
+        image_text = (
+            f"   2D hum {format_angle(image_angles.get('humerus_flexion'))} deg"
+            f"   reach {format_angle(image_angles.get('reach_flexion'))} deg"
+        )
+        cv2.putText(
+            frame,
+            image_text,
+            (x, row_y + 24),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.56,
+            (110, 235, 255),
             2,
             cv2.LINE_AA,
         )
@@ -189,7 +214,7 @@ def draw_test_capture_panel(frame, test_capture) -> None:
         return
 
     height, width = frame.shape[:2]
-    panel_width, panel_height = 620, 128
+    panel_width, panel_height = 700, 156
     x = max(width - panel_width - 24, 24)
     y = max(height - panel_height - 24, 24)
 
@@ -257,21 +282,26 @@ def draw_rom_panel(frame, rom, now: float) -> None:
 
     step = rom.step()
     if rom.recording and step is not None:
-        remaining = max(rom.duration_seconds - (now - rom.started_at), 0.0)
+        elapsed = max(now - rom.started_at, 0.0)
+        image_plane = (rom.last_image_plane_angles or {}).get(step.arm, {})
+        image_plane_text = (
+            f"2D frame flex: hum {format_angle(image_plane.get('humerus_flexion'))} deg"
+            f" | reach {format_angle(image_plane.get('reach_flexion'))} deg"
+        )
         title = f"ROM sweep recording: {step.arm} arm"
         instruction = step.instruction
-        expected = "Sweep down -> overhead -> down. Keep torso as still as practical."
-        status = f"{remaining:4.1f}s left | Space finishes early"
+        expected = "Move slowly into max flexion. Hold briefly if useful; Space stops and saves."
+        status = f"Recording {elapsed:4.1f}s | Press Space to stop"
         color = (190, 120, 255)
     elif step is not None:
         title = f"ROM sweep {rom.current_step + 1}/{len(rom.steps)}: {step.arm} arm"
         instruction = step.instruction
-        expected = "Press Space to start timed recording."
+        expected = "Press Space to start; press Space again when the sweep is complete."
         status = rom.status
         color = (190, 120, 255)
     else:
         title = "ROM sweep complete"
-        instruction = "Press r to repeat left/right flexion ROM sweeps."
+        instruction = "Press r to repeat flexion ROM sweeps for the current view."
         expected = (
             f"Last saved: {rom.last_saved_json_path}"
             if rom.last_saved_json_path
@@ -284,9 +314,10 @@ def draw_rom_panel(frame, rom, now: float) -> None:
         (title, 0.66, color, 2),
         (instruction, 0.54, (245, 240, 255), 1),
         (expected, 0.48, (220, 205, 255), 1),
+        (image_plane_text if rom.recording and step is not None else "", 0.52, (110, 235, 255), 2),
         (status, 0.54, (255, 230, 160), 2),
     )
-    draw_lines(frame, lines, x, y, line_height=29, truncate=95)
+    draw_lines(frame, lines, x, y, line_height=28, truncate=105)
 
 
 def draw_lines(frame, lines, x: int, y: int, line_height: int = 30, truncate: int | None = None) -> None:
@@ -334,6 +365,7 @@ def render_frame(
     result,
     visibility_threshold: float,
     angles,
+    image_plane_angles,
     calibration,
     test_capture,
     rom,
@@ -345,7 +377,7 @@ def render_frame(
 ) -> None:
     draw_pose(frame, result, visibility_threshold)
     draw_status(frame, view_mode, pose_count, fps, result_timestamp_ms)
-    draw_angle_panel(frame, angles)
+    draw_angle_panel(frame, angles, image_plane_angles)
     draw_calibration_panel(frame, calibration, view_mode)
     draw_test_capture_panel(frame, test_capture)
     draw_rom_panel(frame, rom, now)

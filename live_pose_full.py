@@ -26,6 +26,10 @@ DEFAULT_MODEL_PATH = Path("models/pose_landmarker_full.task")
 LEFT_ARM = {"name": "L", "shoulder": 11, "elbow": 13}
 RIGHT_ARM = {"name": "R", "shoulder": 12, "elbow": 14}
 CALIBRATION_LANDMARKS = (11, 12, 13, 14, 23, 24)
+ROM_LANDMARKS = {
+    "L": {"shoulder": 11, "elbow": 13, "wrist": 15, "index": 19, "pinky": 17},
+    "R": {"shoulder": 12, "elbow": 14, "wrist": 16, "index": 20, "pinky": 18},
+}
 
 
 @dataclass(frozen=True)
@@ -204,6 +208,43 @@ class ROMSweepStep:
     instruction: str
 
 
+def rom_steps_for_view(view_mode: str) -> tuple[ROMSweepStep, ...]:
+    # The image is mirrored before MediaPipe inference, so the camera-side
+    # landmark label is opposite the physical side-view name.
+    camera_side_by_view = {
+        "right-45": ("L", "right-front diagonal"),
+        "right-side": ("L", "right side"),
+        "left-45": ("R", "left-front diagonal"),
+        "left-side": ("R", "left side"),
+    }
+    selected = camera_side_by_view.get(view_mode)
+    if selected is not None:
+        arm, view_label = selected
+        return (
+            ROMSweepStep(
+                f"{view_mode.replace('-', '_')}_camera_side_flexion_sweep",
+                arm,
+                (
+                    f"Camera-side arm only ({arm} landmark, {view_label} view): "
+                    "start down, sweep forward/up overhead, continue behind head, then press Space to stop."
+                ),
+            ),
+        )
+
+    return (
+        ROMSweepStep(
+            "left_flexion_sweep",
+            "L",
+            "Left landmark arm only: start down, sweep forward/up overhead, continue behind head, then press Space to stop.",
+        ),
+        ROMSweepStep(
+            "right_flexion_sweep",
+            "R",
+            "Right landmark arm only: start down, sweep forward/up overhead, continue behind head, then press Space to stop.",
+        ),
+    )
+
+
 @dataclass
 class ROMSweepState:
     duration_seconds: float = 10.0
@@ -213,9 +254,12 @@ class ROMSweepState:
     session_id: str = ""
     capture_index: int = 0
     started_at: float = 0.0
+    view_mode: str = "front"
     status: str = "Press r to start ROM sweep"
     samples: list[dict] = field(default_factory=list)
     key_frames: dict[str, dict] = field(default_factory=dict)
+    frame_samples: list[dict] = field(default_factory=list)
+    last_image_plane_angles: dict | None = None
     last_saved_json_path: Path | None = None
     steps: tuple[ROMSweepStep, ...] = (
         ROMSweepStep(
@@ -230,17 +274,27 @@ class ROMSweepState:
         ),
     )
 
-    def start(self) -> None:
+    def start(self, view_mode: str) -> None:
         self.active = True
         self.recording = False
+        self.view_mode = view_mode
+        self.steps = rom_steps_for_view(view_mode)
         self.current_step = 0
         self.capture_index = 0
         self.started_at = 0.0
         self.samples.clear()
         self.key_frames.clear()
+        self.frame_samples.clear()
+        self.last_image_plane_angles = None
         self.last_saved_json_path = None
         self.session_id = time.strftime("%Y%m%d_%H%M%S")
-        self.status = "ROM test started. Press Space to record left arm."
+        step = self.step()
+        if step is None:
+            self.status = "No ROM sweep configured for this view."
+        elif len(self.steps) == 1:
+            self.status = f"ROM test started for {view_mode}. Press Space to record the camera-side arm."
+        else:
+            self.status = "ROM test started. Press Space to record the first arm."
 
     def step(self) -> ROMSweepStep | None:
         if not self.active or self.current_step >= len(self.steps):
@@ -256,7 +310,9 @@ class ROMSweepState:
         self.started_at = now
         self.samples.clear()
         self.key_frames.clear()
-        self.status = f"Recording {step.name}"
+        self.frame_samples.clear()
+        self.last_image_plane_angles = None
+        self.status = f"Recording {step.name}. Press Space again to stop."
 
     def finish_if_done(self) -> None:
         if self.current_step >= len(self.steps):
@@ -356,7 +412,7 @@ def parse_args() -> argparse.Namespace:
         "--rom-sweep-seconds",
         type=float,
         default=10.0,
-        help="Seconds to record each left/right shoulder flexion ROM sweep.",
+        help="Deprecated. ROM sweeps now record until Space is pressed again.",
     )
     parser.add_argument(
         "--no-visualize-on-quit",
@@ -409,6 +465,23 @@ def v_normalize(v):
     if length < 1e-6:
         return None
     return v_scale(v, 1.0 / length)
+
+
+def image_plane_flexion_angle(shoulder, distal) -> float | None:
+    if shoulder is None or distal is None:
+        return None
+
+    dx = distal.x - shoulder.x
+    dy = distal.y - shoulder.y
+    if math.hypot(dx, dy) < 1e-6:
+        return None
+
+    # Image-space convention for fixed side-ish camera views:
+    # 0=down, 90=left in frame, 180=up, >180=past vertical toward frame-right.
+    angle = math.degrees(math.atan2(-dx, dy))
+    if angle < -90.0:
+        angle += 360.0
+    return angle
 
 
 def v_lerp(a, b, alpha: float):
@@ -833,6 +906,7 @@ def make_diagnostic_sample(
     calibration: CalibrationState,
     test_step_name: str | None,
     image_sample=None,
+    image_plane_angles=None,
 ) -> dict:
     return {
         "time_monotonic": now,
@@ -843,6 +917,7 @@ def make_diagnostic_sample(
         "calibration_ready": calibration.axes is not None,
         "test_step": test_step_name,
         "angles": angles,
+        "image_plane_angles": image_plane_angles or {},
         "image_sample": {
             str(idx): list(value)
             for idx, value in image_sample.items()
@@ -855,6 +930,136 @@ def make_diagnostic_sample(
         "pose_world_landmarks": serialize_landmark_lists(
             result.pose_world_landmarks if result else []
         ),
+    }
+
+
+def get_world_landmark(result, idx: int):
+    if not result or not result.pose_world_landmarks:
+        return None
+    world_landmarks = result.pose_world_landmarks[0]
+    if idx >= len(world_landmarks):
+        return None
+    return vec_from_landmark(world_landmarks[idx])
+
+
+def get_image_landmark(result, idx: int):
+    if not result or not result.pose_landmarks:
+        return None
+    image_landmarks = result.pose_landmarks[0]
+    if idx >= len(image_landmarks):
+        return None
+    return image_landmarks[idx]
+
+
+def landmark_confidence(result, idx: int) -> float | None:
+    landmark = get_image_landmark(result, idx)
+    if landmark is None:
+        return None
+    visibility = getattr(landmark, "visibility", 1.0)
+    presence = getattr(landmark, "presence", 1.0)
+    return min(visibility, presence)
+
+
+def midpoint(a, b):
+    if a is None and b is None:
+        return None
+    if a is None:
+        return b
+    if b is None:
+        return a
+    return v_scale(v_add(a, b), 0.5)
+
+
+def image_midpoint(a, b):
+    if a is None and b is None:
+        return None
+    if a is None:
+        return b
+    if b is None:
+        return a
+
+    class Point:
+        pass
+
+    point = Point()
+    point.x = (a.x + b.x) * 0.5
+    point.y = (a.y + b.y) * 0.5
+    point.z = (getattr(a, "z", 0.0) + getattr(b, "z", 0.0)) * 0.5
+    return point
+
+
+def image_plane_angles_from_result(result, arm_name: str) -> dict:
+    landmarks = ROM_LANDMARKS[arm_name]
+    shoulder = get_image_landmark(result, landmarks["shoulder"])
+    elbow = get_image_landmark(result, landmarks["elbow"])
+    wrist = get_image_landmark(result, landmarks["wrist"])
+    index = get_image_landmark(result, landmarks["index"])
+    pinky = get_image_landmark(result, landmarks["pinky"])
+    hand = image_midpoint(index, pinky) or wrist
+
+    confidence_indices = [
+        landmarks["shoulder"],
+        landmarks["elbow"],
+        landmarks["wrist"],
+        landmarks["index"],
+        landmarks["pinky"],
+    ]
+    confidences = [
+        confidence
+        for confidence in (landmark_confidence(result, idx) for idx in confidence_indices)
+        if confidence is not None
+    ]
+
+    return {
+        "source": "pose_landmarks_image_plane",
+        "convention": "0_down_90_left_180_up",
+        "humerus_flexion": image_plane_flexion_angle(shoulder, elbow),
+        "reach_flexion": image_plane_flexion_angle(shoulder, hand or wrist or elbow),
+        "confidence": min(confidences) if confidences else None,
+    }
+
+
+def all_image_plane_angles_from_result(result) -> dict[str, dict]:
+    return {
+        "L": image_plane_angles_from_result(result, "L"),
+        "R": image_plane_angles_from_result(result, "R"),
+    }
+
+
+def rom_vectors_from_result(result, arm_name: str) -> dict:
+    landmarks = ROM_LANDMARKS[arm_name]
+    shoulder = get_world_landmark(result, landmarks["shoulder"])
+    elbow = get_world_landmark(result, landmarks["elbow"])
+    wrist = get_world_landmark(result, landmarks["wrist"])
+    index = get_world_landmark(result, landmarks["index"])
+    pinky = get_world_landmark(result, landmarks["pinky"])
+    hand = midpoint(index, pinky) or wrist
+
+    humerus = v_normalize(v_sub(elbow, shoulder)) if shoulder and elbow else None
+    reach_target = hand or wrist or elbow
+    reach = v_normalize(v_sub(reach_target, shoulder)) if shoulder and reach_target else None
+
+    confidence_indices = [
+        landmarks["shoulder"],
+        landmarks["elbow"],
+        landmarks["wrist"],
+        landmarks["index"],
+        landmarks["pinky"],
+    ]
+    confidences = [
+        confidence
+        for confidence in (landmark_confidence(result, idx) for idx in confidence_indices)
+        if confidence is not None
+    ]
+
+    return {
+        "humerus": list(humerus) if humerus else None,
+        "reach": list(reach) if reach else None,
+        "shoulder": list(shoulder) if shoulder else None,
+        "elbow": list(elbow) if elbow else None,
+        "wrist": list(wrist) if wrist else None,
+        "hand": list(hand) if hand else None,
+        "confidence": min(confidences) if confidences else None,
     }
 
 
@@ -985,28 +1190,45 @@ def update_rom_key_frames(rom: ROMSweepState, sample: dict, frame) -> None:
     if step is None:
         return
 
+    sample_index = len(rom.samples) - 1
+    ok, encoded = cv2.imencode(".jpg", frame, [cv2.IMWRITE_JPEG_QUALITY, 90])
+    if ok:
+        rom.frame_samples.append({
+            "sample_index": sample_index,
+            "sample": sample,
+            "image_bytes": encoded.tobytes(),
+            "extension": "jpg",
+            "source": "recorded_sample",
+        })
+
     flexion = sample_angle(sample, step.arm, "flexion")
     if flexion is None:
         return
 
     if "start" not in rom.key_frames:
         rom.key_frames["start"] = {
+            "sample_index": sample_index,
             "sample": sample,
             "frame": frame.copy(),
+            "source": "live_start",
         }
 
     current_min = rom.key_frames.get("min_flexion", {}).get("sample")
     if current_min is None or flexion < sample_angle(current_min, step.arm, "flexion"):
         rom.key_frames["min_flexion"] = {
+            "sample_index": sample_index,
             "sample": sample,
             "frame": frame.copy(),
+            "source": "live_min_flexion",
         }
 
     current_max = rom.key_frames.get("max_flexion", {}).get("sample")
     if current_max is None or flexion > sample_angle(current_max, step.arm, "flexion"):
         rom.key_frames["max_flexion"] = {
+            "sample_index": sample_index,
             "sample": sample,
             "frame": frame.copy(),
+            "source": "live_max_flexion",
         }
 
     current_near_90 = rom.key_frames.get("near_90", {}).get("sample")
@@ -1015,13 +1237,17 @@ def update_rom_key_frames(rom: ROMSweepState, sample: dict, frame) -> None:
         or abs(flexion - 90.0) < abs(sample_angle(current_near_90, step.arm, "flexion") - 90.0)
     ):
         rom.key_frames["near_90"] = {
+            "sample_index": sample_index,
             "sample": sample,
             "frame": frame.copy(),
+            "source": "live_near_90",
         }
 
     rom.key_frames["end"] = {
+        "sample_index": sample_index,
         "sample": sample,
         "frame": frame.copy(),
+        "source": "live_end",
     }
 
 
@@ -1101,6 +1327,281 @@ def summarize_rom_sweep(recording: dict) -> dict:
     }
 
 
+def vector_from_sample(sample: dict, arm: str, vector_name: str):
+    value = (
+        sample.get("rom_vectors", {})
+        .get(arm, {})
+        .get(vector_name)
+    )
+    return tuple(value) if value is not None else None
+
+
+def image_plane_angle_from_sample(sample: dict, arm: str, angle_name: str) -> float | None:
+    return (
+        sample.get("image_plane_angles", {})
+        .get(arm, {})
+        .get(angle_name)
+    )
+
+
+def estimate_motion_plane_normal(vectors: list[tuple[float, float, float]]):
+    if len(vectors) < 2:
+        return None
+
+    start = vectors[0]
+    normals = []
+    for vector in vectors[1:]:
+        normal = v_normalize(v_cross(start, vector))
+        if normal is not None:
+            normals.append(normal)
+    if not normals:
+        return None
+
+    reference = normals[0]
+    aligned = [
+        normal if v_dot(normal, reference) >= 0 else v_scale(normal, -1.0)
+        for normal in normals
+    ]
+    return v_normalize(average_vectors(aligned))
+
+
+def unwrap_degrees(values: list[float | None]) -> list[float | None]:
+    unwrapped = []
+    previous = None
+    offset = 0.0
+    for value in values:
+        if value is None:
+            unwrapped.append(None)
+            continue
+        adjusted = value + offset
+        if previous is not None:
+            while adjusted - previous > 180.0:
+                offset -= 360.0
+                adjusted = value + offset
+            while adjusted - previous < -180.0:
+                offset += 360.0
+                adjusted = value + offset
+        unwrapped.append(adjusted)
+        previous = adjusted
+    return unwrapped
+
+
+def summarize_unwrapped_vector_sweep(recording: dict, vector_name: str) -> dict:
+    arm = recording["arm"]
+    samples = recording.get("samples", [])
+    indexed_vectors = [
+        (idx, vector)
+        for idx, sample in enumerate(samples)
+        if (vector := vector_from_sample(sample, arm, vector_name)) is not None
+    ]
+    if len(indexed_vectors) < 3:
+        return {
+            "vector": vector_name,
+            "valid_samples": len(indexed_vectors),
+            "total_samples": len(samples),
+            "valid_ratio": len(indexed_vectors) / len(samples) if samples else None,
+            "rom": None,
+        }
+
+    valid_indices = [idx for idx, _vector in indexed_vectors]
+    vectors = [vector for _idx, vector in indexed_vectors]
+    plane_normal = estimate_motion_plane_normal(vectors)
+    if plane_normal is None:
+        return {
+            "vector": vector_name,
+            "valid_samples": len(indexed_vectors),
+            "total_samples": len(samples),
+            "valid_ratio": len(indexed_vectors) / len(samples) if samples else None,
+            "rom": None,
+        }
+
+    zero_axis = v_normalize(project_onto_plane(vectors[0], plane_normal))
+    if zero_axis is None:
+        return {
+            "vector": vector_name,
+            "valid_samples": len(indexed_vectors),
+            "total_samples": len(samples),
+            "valid_ratio": len(indexed_vectors) / len(samples) if samples else None,
+            "rom": None,
+        }
+    positive_axis = v_normalize(v_cross(plane_normal, zero_axis))
+    if positive_axis is None:
+        return {
+            "vector": vector_name,
+            "valid_samples": len(indexed_vectors),
+            "total_samples": len(samples),
+            "valid_ratio": len(indexed_vectors) / len(samples) if samples else None,
+            "rom": None,
+        }
+
+    signed_angles = [
+        signed_plane_angle(
+            vector,
+            zero_axis=zero_axis,
+            positive_axis=positive_axis,
+            plane_normal=plane_normal,
+        )
+        for vector in vectors
+    ]
+    unwrapped = unwrap_degrees(signed_angles)
+    numeric_unwrapped = [value for value in unwrapped if value is not None]
+    if not numeric_unwrapped:
+        return {
+            "vector": vector_name,
+            "valid_samples": len(indexed_vectors),
+            "total_samples": len(samples),
+            "valid_ratio": len(indexed_vectors) / len(samples) if samples else None,
+            "rom": None,
+        }
+
+    if abs(min(numeric_unwrapped)) > abs(max(numeric_unwrapped)):
+        unwrapped = [
+            -value if value is not None else None
+            for value in unwrapped
+        ]
+        numeric_unwrapped = [value for value in unwrapped if value is not None]
+        positive_axis = v_scale(positive_axis, -1.0)
+
+    min_value = min(numeric_unwrapped)
+    max_value = max(numeric_unwrapped)
+    min_valid_idx = numeric_unwrapped.index(min_value)
+    max_valid_idx = numeric_unwrapped.index(max_value)
+    min_sample_idx = valid_indices[min_valid_idx]
+    max_sample_idx = valid_indices[max_valid_idx]
+    started_at = recording.get("started_at", samples[0].get("time_monotonic", 0.0))
+
+    trace = [
+        {
+            "sample_index": sample_idx,
+            "time_offset": samples[sample_idx]["time_monotonic"] - started_at,
+            "angle": angle,
+        }
+        for sample_idx, angle in zip(valid_indices, unwrapped)
+        if angle is not None
+    ]
+
+    return {
+        "vector": vector_name,
+        "method": "sweep_plane_unwrapped",
+        "plane_normal": list(plane_normal),
+        "zero_axis": list(zero_axis),
+        "positive_axis": list(positive_axis),
+        "valid_samples": len(indexed_vectors),
+        "total_samples": len(samples),
+        "valid_ratio": len(indexed_vectors) / len(samples) if samples else None,
+        "min_angle": min_value,
+        "max_angle": max_value,
+        "rom": max_value - min_value,
+        "start_angle": numeric_unwrapped[0],
+        "end_angle": numeric_unwrapped[-1],
+        "min_time_offset": samples[min_sample_idx]["time_monotonic"] - started_at,
+        "max_time_offset": samples[max_sample_idx]["time_monotonic"] - started_at,
+        "min_sample_index": min_sample_idx,
+        "max_sample_index": max_sample_idx,
+        "trace": trace,
+    }
+
+
+def summarize_image_plane_angle_sweep(recording: dict, angle_name: str) -> dict:
+    arm = recording["arm"]
+    samples = recording.get("samples", [])
+    indexed_values = [
+        (idx, value)
+        for idx, sample in enumerate(samples)
+        if (value := image_plane_angle_from_sample(sample, arm, angle_name)) is not None
+    ]
+    if len(indexed_values) < 3:
+        return {
+            "angle": angle_name,
+            "valid_samples": len(indexed_values),
+            "total_samples": len(samples),
+            "valid_ratio": len(indexed_values) / len(samples) if samples else None,
+            "rom": None,
+        }
+
+    valid_indices = [idx for idx, _value in indexed_values]
+    values = [value for _idx, value in indexed_values]
+    min_value = min(values)
+    max_value = max(values)
+    min_valid_idx = values.index(min_value)
+    max_valid_idx = values.index(max_value)
+    min_sample_idx = valid_indices[min_valid_idx]
+    max_sample_idx = valid_indices[max_valid_idx]
+    started_at = recording.get("started_at", samples[0].get("time_monotonic", 0.0))
+
+    trace = [
+        {
+            "sample_index": sample_idx,
+            "time_offset": samples[sample_idx]["time_monotonic"] - started_at,
+            "angle": value,
+        }
+        for sample_idx, value in indexed_values
+    ]
+
+    return {
+        "angle": angle_name,
+        "method": "image_plane_fixed_camera",
+        "convention": "0_down_90_frame_left_180_up_gt180_past_vertical",
+        "valid_samples": len(indexed_values),
+        "total_samples": len(samples),
+        "valid_ratio": len(indexed_values) / len(samples) if samples else None,
+        "min_angle": min_value,
+        "max_angle": max_value,
+        "rom": max_value - min_value,
+        "start_angle": values[0],
+        "end_angle": values[-1],
+        "min_time_offset": samples[min_sample_idx]["time_monotonic"] - started_at,
+        "max_time_offset": samples[max_sample_idx]["time_monotonic"] - started_at,
+        "min_sample_index": min_sample_idx,
+        "max_sample_index": max_sample_idx,
+        "trace": trace,
+    }
+
+
+def summarize_image_plane_rom_sweep(recording: dict) -> dict:
+    return {
+        "source": "pose_landmarks_image_plane",
+        "goal": "fixed_camera_side_view_flexion_estimate",
+        "convention": "0_down_90_frame_left_180_up_gt180_past_vertical",
+        "humerus": summarize_image_plane_angle_sweep(recording, "humerus_flexion"),
+        "reach": summarize_image_plane_angle_sweep(recording, "reach_flexion"),
+    }
+
+
+def summarize_advanced_rom_sweep(recording: dict) -> dict:
+    return {
+        "source": "rom_vectors_world_landmarks",
+        "goal": "behind_head_flexion_rom",
+        "humerus": summarize_unwrapped_vector_sweep(recording, "humerus"),
+        "reach": summarize_unwrapped_vector_sweep(recording, "reach"),
+    }
+
+
+def frame_sample_by_index(rom: ROMSweepState, sample_index: int | None) -> dict | None:
+    if sample_index is None:
+        return None
+    return next(
+        (
+            item
+            for item in rom.frame_samples
+            if item.get("sample_index") == sample_index
+        ),
+        None,
+    )
+
+
+def write_rom_frame(output_dir: Path, prefix: str, label: str, item: dict) -> Path:
+    extension = item.get("extension")
+    if item.get("image_bytes") is not None and extension:
+        image_path = output_dir / f"{prefix}_{label}.{extension}"
+        image_path.write_bytes(item["image_bytes"])
+        return image_path
+
+    image_path = output_dir / f"{prefix}_{label}.png"
+    cv2.imwrite(str(image_path), item["frame"])
+    return image_path
+
+
 def save_rom_sweep(rom: ROMSweepState, output_dir: Path) -> None:
     step = rom.step()
     if step is None:
@@ -1113,17 +1614,6 @@ def save_rom_sweep(rom: ROMSweepState, output_dir: Path) -> None:
     output_dir.mkdir(parents=True, exist_ok=True)
     rom.capture_index += 1
     prefix = f"{rom.session_id}_rom_{rom.capture_index:02d}_{step.name}"
-    image_paths = {}
-    key_frame_metadata = {}
-    for label, item in rom.key_frames.items():
-        image_path = output_dir / f"{prefix}_{label}.png"
-        cv2.imwrite(str(image_path), item["frame"])
-        image_paths[label] = str(image_path)
-        key_frame_metadata[label] = {
-            "time_monotonic": item["sample"].get("time_monotonic"),
-            "angles": item["sample"].get("angles"),
-        }
-
     recording = {
         "type": "rom_sweep",
         "session_id": rom.session_id,
@@ -1139,12 +1629,75 @@ def save_rom_sweep(rom: ROMSweepState, output_dir: Path) -> None:
         ),
         "calibration_ready_at_capture": bool(rom.samples[-1].get("calibration_ready")),
         "started_at": rom.started_at,
-        "duration_target_seconds": rom.duration_seconds,
-        "image_paths": image_paths,
-        "key_frames": key_frame_metadata,
+        "duration_target_seconds": None,
+        "stop_mode": "manual_spacebar",
         "samples": rom.samples,
     }
     recording["rom_summary"] = summarize_rom_sweep(recording)
+    recording["advanced_rom_summary"] = summarize_advanced_rom_sweep(recording)
+    recording["image_plane_rom_summary"] = summarize_image_plane_rom_sweep(recording)
+
+    image_paths = {}
+    key_frame_metadata = {}
+    selected_frames = dict(rom.key_frames)
+    reach_summary = recording["advanced_rom_summary"].get("reach", {})
+    humerus_summary = recording["advanced_rom_summary"].get("humerus", {})
+    image_plane_summary = recording["image_plane_rom_summary"]
+    started_at = recording["started_at"]
+    for vector_name, summary in (("reach", reach_summary), ("humerus", humerus_summary)):
+        for label, time_key in (("min", "min_time_offset"), ("max", "max_time_offset")):
+            sample_index = summary.get(f"{label}_sample_index")
+            selected = frame_sample_by_index(rom, sample_index)
+            if selected is None:
+                time_offset = summary.get(time_key)
+                if time_offset is None:
+                    continue
+                target_time = started_at + time_offset
+                selected = min(
+                    rom.frame_samples,
+                    key=lambda item: abs(item["sample"]["time_monotonic"] - target_time),
+                ) if rom.frame_samples else None
+            if selected is None:
+                continue
+            selected_frames[f"{vector_name}_{label}"] = {
+                **selected,
+                "source": f"advanced_{vector_name}_{label}",
+            }
+    for angle_name, summary in (
+        ("image_reach", image_plane_summary.get("reach", {})),
+        ("image_humerus", image_plane_summary.get("humerus", {})),
+    ):
+        for label, time_key in (("min", "min_time_offset"), ("max", "max_time_offset")):
+            sample_index = summary.get(f"{label}_sample_index")
+            selected = frame_sample_by_index(rom, sample_index)
+            if selected is None:
+                time_offset = summary.get(time_key)
+                if time_offset is None:
+                    continue
+                target_time = started_at + time_offset
+                selected = min(
+                    rom.frame_samples,
+                    key=lambda item: abs(item["sample"]["time_monotonic"] - target_time),
+                ) if rom.frame_samples else None
+            if selected is None:
+                continue
+            selected_frames[f"{angle_name}_{label}"] = {
+                **selected,
+                "source": f"image_plane_{angle_name}_{label}",
+            }
+
+    for label, item in selected_frames.items():
+        image_path = write_rom_frame(output_dir, prefix, label, item)
+        image_paths[label] = str(image_path)
+        key_frame_metadata[label] = {
+            "sample_index": item.get("sample_index"),
+            "source": item.get("source"),
+            "time_monotonic": item["sample"].get("time_monotonic"),
+            "angles": item["sample"].get("angles"),
+        }
+
+    recording["image_paths"] = image_paths
+    recording["key_frames"] = key_frame_metadata
 
     output_path = output_dir / f"{prefix}.json"
     output_path.write_text(json.dumps(recording, indent=2), encoding="utf-8")
@@ -1153,6 +1706,8 @@ def save_rom_sweep(rom: ROMSweepState, output_dir: Path) -> None:
     rom.recording = False
     rom.samples.clear()
     rom.key_frames.clear()
+    rom.frame_samples.clear()
+    rom.last_image_plane_angles = None
     next_step = rom.step()
     if next_step is None:
         rom.finish_if_done()
@@ -1432,6 +1987,7 @@ def main() -> None:
             active_test_step = test_capture.step()
             landmark_samples = get_landmark_samples(result, args.min_confidence)
             image_sample = landmark_samples[0] if landmark_samples else None
+            image_plane_angles = all_image_plane_angles_from_result(result)
             diagnostic_sample = make_diagnostic_sample(
                 now=now,
                 result_timestamp_ms=result_timestamp_ms,
@@ -1444,13 +2000,18 @@ def main() -> None:
                 calibration=calibration,
                 test_step_name=active_test_step.name if active_test_step else None,
                 image_sample=image_sample,
+                image_plane_angles=image_plane_angles,
             )
+            if rom_sweep.recording:
+                rom_sweep.last_image_plane_angles = image_plane_angles
+                diagnostic_sample["rom_vectors"] = {
+                    "L": rom_vectors_from_result(result, "L"),
+                    "R": rom_vectors_from_result(result, "R"),
+                }
             diagnostic_history.append(diagnostic_sample)
             if rom_sweep.recording:
                 rom_sweep.samples.append(diagnostic_sample)
                 update_rom_key_frames(rom_sweep, diagnostic_sample, frame)
-                if now - rom_sweep.started_at >= rom_sweep.duration_seconds:
-                    save_rom_sweep(rom_sweep, args.capture_dir)
             update_test_auto_capture(
                 test_capture,
                 result,
@@ -1471,6 +2032,7 @@ def main() -> None:
                 result=result,
                 visibility_threshold=args.min_confidence,
                 angles=angles,
+                image_plane_angles=image_plane_angles,
                 calibration=calibration,
                 test_capture=test_capture,
                 rom=rom_sweep,
@@ -1494,7 +2056,7 @@ def main() -> None:
             elif key == ord("r"):
                 test_capture.active = False
                 test_capture.pending_capture = None
-                rom_sweep.start()
+                rom_sweep.start(args.view)
             elif key == ord(" "):
                 if calibration.active:
                     capture_calibration_now(calibration, result, args.min_confidence)
