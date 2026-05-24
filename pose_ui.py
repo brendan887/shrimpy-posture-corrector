@@ -46,7 +46,7 @@ except ImportError:
 # Backwards-compatible constants used by live_pose_full.py
 # ---------------------------------------------------------------------------
 
-VIEW_MODES = ("front", "left-45", "right-45")
+VIEW_MODES = ("front", "left-45", "right-45", "left-side", "right-side")
 
 VIEW_GUIDANCE = {
     "front": {
@@ -55,11 +55,19 @@ VIEW_GUIDANCE = {
     },
     "left-45": {
         "title": "Left 45-degree mode",
-        "instruction": "Place camera at your left-front 45 deg angle. Good compromise for flexion.",
+        "instruction": "Place camera at your left-front 45 deg angle. ROM defaults to camera-side R; arrows can switch.",
     },
     "right-45": {
         "title": "Right 45-degree mode",
-        "instruction": "Place camera at your right-front 45 deg angle. Good compromise for flexion.",
+        "instruction": "Place camera at your right-front 45 deg angle. ROM defaults to camera-side L; arrows can switch.",
+    },
+    "left-side": {
+        "title": "Left side-view mode",
+        "instruction": "Place camera near your left side. ROM defaults to camera-side R; arrows can switch.",
+    },
+    "right-side": {
+        "title": "Right side-view mode",
+        "instruction": "Place camera near your right side. ROM defaults to camera-side L; arrows can switch.",
     },
 }
 
@@ -466,6 +474,93 @@ class ChecklistItem:
     label: str
     status: str = "pending"   # done | active | pending | failed
     detail: str = ""
+def draw_angle_panel(frame, angles, image_plane_angles=None, now: float = 0.0) -> None:
+    image_plane_angles = image_plane_angles or {}
+    panel_width, panel_height = 690, 172
+    x, y = 24, 92 + int(panel_height * 0.25)
+    overlay = frame.copy()
+    cv2.rectangle(
+        overlay,
+        (x - 10, y - 28),
+        (x + panel_width, y + panel_height),
+        (10, 24, 32),
+        -1,
+    )
+    cv2.addWeighted(overlay, 0.58, frame, 0.42, 0, frame)
+
+    cv2.putText(
+        frame,
+        "Shoulder angle relative to torso",
+        (x, y),
+        cv2.FONT_HERSHEY_SIMPLEX,
+        0.62,
+        (220, 245, 255),
+        2,
+        cv2.LINE_AA,
+    )
+    cv2.putText(
+        frame,
+        "0 down | 90 straight out | 180 overhead",
+        (x, y + 28),
+        cv2.FONT_HERSHEY_SIMPLEX,
+        0.5,
+        (190, 210, 220),
+        1,
+        cv2.LINE_AA,
+    )
+
+    for row, arm_name in enumerate(("L", "R")):
+        arm_angles = angles.get(arm_name, {})
+        image_angles = image_plane_angles.get(arm_name, {})
+        row_y = y + 62 + (row * 54)
+        text = (
+            f"{arm_name}  flex {format_angle(arm_angles.get('flexion'))} deg"
+            f"   abd {format_angle(arm_angles.get('abduction'))} deg"
+        )
+        cv2.putText(
+            frame,
+            text,
+            (x, row_y),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.72,
+            (80, 220, 255) if arm_name == "L" else (40, 255, 120),
+            2,
+            cv2.LINE_AA,
+        )
+        image_text = (
+            f"   2D hum {format_angle(image_angles.get('humerus_flexion'))} deg"
+            f"   reach {format_angle(image_angles.get('reach_flexion'))} deg"
+        )
+        cv2.putText(
+            frame,
+            image_text,
+            (x, row_y + 24),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.56,
+            (110, 235, 255),
+            2,
+            cv2.LINE_AA,
+        )
+        elbow_angle = image_angles.get("elbow_angle")
+        elbow_warning = elbow_angle is not None and elbow_angle < 130.0
+        flash_on = int(now * 4) % 2 == 0
+        elbow_color = (
+            (40, 40, 255)
+            if elbow_warning and flash_on
+            else (80, 80, 150)
+            if elbow_warning
+            else (110, 235, 255)
+        )
+        cv2.putText(
+            frame,
+            f"   elbow {format_angle(elbow_angle)} deg",
+            (x + 350, row_y + 24),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.56,
+            elbow_color,
+            2,
+            cv2.LINE_AA,
+        )
 
 
 @dataclass
@@ -821,6 +916,10 @@ def draw_angle_overlay(frame, state: UIState) -> None:
 
     h, w = frame.shape[:2]
     cx, cy, cw, ch = _camera_bounds(w, h)
+    height, width = frame.shape[:2]
+    panel_width, panel_height = 700, 156
+    x = max(width - panel_width - 24, 24)
+    y = max(height - panel_height - 24, 24)
 
     reading = state.angles[0]
     status_color = {
@@ -894,6 +993,109 @@ def draw_countdown(frame, state: UIState) -> None:
     if angle > 0:
         cv2.ellipse(frame, (ring_cx, ring_cy), (radius, radius), -90, 0, angle,
                     C.ACCENT, 4, cv2.LINE_AA)
+    step = rom.step()
+    if rom.recording and step is not None:
+        elapsed = max(now - rom.started_at, 0.0)
+        image_plane = (rom.last_image_plane_angles or {}).get(step.arm, {})
+        image_plane_text = (
+            f"2D frame flex: hum {format_angle(image_plane.get('humerus_flexion'))} deg"
+            f" | reach {format_angle(image_plane.get('reach_flexion'))} deg"
+        )
+        title = f"ROM sweep recording: {step.arm} arm"
+        instruction = step.instruction
+        expected = "Move slowly into max flexion. Hold briefly if useful; Space stops and saves."
+        status = f"Recording {elapsed:4.1f}s | Press Space to stop"
+        color = (190, 120, 255)
+    elif step is not None:
+        title = f"ROM sweep {rom.current_step + 1}/{len(rom.steps)}: {step.arm} arm"
+        instruction = step.instruction
+        expected = "Left/Right arrows select arm. Space starts; Space again saves."
+        status = rom.status
+        color = (190, 120, 255)
+    else:
+        title = "ROM sweep complete"
+        instruction = "Press r to repeat flexion ROM sweeps for the current view."
+        expected = (
+            f"Last saved: {rom.last_saved_json_path}"
+            if rom.last_saved_json_path
+            else "No ROM sweep saved yet."
+        )
+        status = rom.status
+        color = (40, 255, 120)
+
+    lines = (
+        (title, 0.66, color, 2),
+        (instruction, 0.54, (245, 240, 255), 1),
+        (expected, 0.48, (220, 205, 255), 1),
+        (image_plane_text if rom.recording and step is not None else "", 0.52, (110, 235, 255), 2),
+        (status, 0.54, (255, 230, 160), 2),
+    )
+    draw_lines(frame, lines, x, y, line_height=28, truncate=105)
+
+
+PHASE_LABELS = {
+    "disconnected": ("ROBOT OFFLINE", (120, 120, 140)),
+    "at_home": ("AT HOME", (180, 180, 180)),
+    "moving_to_start": ("MOVING TO START", (80, 220, 255)),
+    "at_start": ("AT START - awaiting auth", (120, 220, 255)),
+    "executing": ("EXECUTING", (40, 255, 120)),
+    "at_end": ("AT END - awaiting auth", (255, 200, 80)),
+    "returning_home": ("RETURNING HOME", (80, 220, 255)),
+    "aborted": ("ABORTED", (60, 80, 255)),
+}
+
+
+def draw_robot_panel(frame, robot_state, now: float) -> None:
+    if robot_state is None:
+        return
+
+    _height, width = frame.shape[:2]
+    panel_width, panel_height = 460, 138
+    x = max(width - panel_width - 24, 24)
+    y = 24 + 138 + 16
+
+    overlay = frame.copy()
+    cv2.rectangle(
+        overlay,
+        (x - 10, y - 12),
+        (x + panel_width, y + panel_height),
+        (14, 28, 22),
+        -1,
+    )
+    cv2.addWeighted(overlay, 0.64, frame, 0.36, 0, frame)
+
+    dot_color = (40, 255, 120) if robot_state.connected else (60, 80, 255)
+    cv2.circle(frame, (x + 8, y + 4), 7, dot_color, -1, cv2.LINE_AA)
+
+    capture = robot_state.capture_name or "(no capture selected)"
+    header = f"  ROBOT: {capture}"
+
+    phase_label, phase_color = PHASE_LABELS.get(
+        robot_state.phase, (robot_state.phase.upper(), (220, 220, 220))
+    )
+
+    if robot_state.target:
+        detail_line = f"target: {robot_state.target}"
+    elif robot_state.step:
+        detail_line = f"step: {robot_state.step}"
+    elif robot_state.detail:
+        detail_line = robot_state.detail
+    else:
+        detail_line = ""
+
+    if robot_state.last_event_at > 0:
+        age = max(now - robot_state.last_event_at, 0.0)
+        age_line = f"last event: {age:5.1f}s ago"
+    else:
+        age_line = "last event: --"
+
+    lines = (
+        (header, 0.62, (220, 245, 230), 2),
+        (phase_label, 0.78, phase_color, 2),
+        (detail_line, 0.52, (220, 230, 220), 1),
+        (age_line, 0.46, (170, 190, 175), 1),
+    )
+    draw_lines(frame, lines, x, y, line_height=28, truncate=58)
 
 
 def draw_big_callout(frame, state: UIState) -> None:
@@ -965,7 +1167,13 @@ def render_frame(
     ui_state: Optional[UIState] = None,
 ) -> None:
     draw_pose(frame, result, visibility_threshold)
-
+    draw_status(frame, view_mode, pose_count, fps, result_timestamp_ms)
+    draw_angle_panel(frame, angles, image_plane_angles, now)
+    draw_calibration_panel(frame, calibration, view_mode)
+    draw_test_capture_panel(frame, test_capture)
+    draw_rom_panel(frame, rom, now)
+    draw_robot_panel(frame, robot_state, now)
+    
     if ui_state is None:
         ui_state = _legacy_state_to_ui(
             angles=angles or {},
